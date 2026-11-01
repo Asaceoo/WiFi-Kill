@@ -164,6 +164,7 @@ def build_exe(v: dict) -> Path:
          "--add-data", "wifikill.ico;.",
          "--hidden-import", "tray",
          "--hidden-import", "ui",
+         "--hidden-import", "ipv6",
          "--collect-submodules", "scapy",
          "--collect-data", "scapy",
          "--exclude-module", "numpy",

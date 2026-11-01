@@ -1,0 +1,208 @@
+"""ipv6 模块的报文级单元测试。
+
+设计原则：**不碰网卡、不发一个包**。
+CI 环境（GitHub Actions 的 ubuntu-latest）没有 Npcap，任何 sendp 都会失败，
+所以这里只断言「构造出来的东西对不对」，真实发包由本机暗桩验证覆盖。
+"""
+
+import sys
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import ipv6  # noqa: E402
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, ok, detail=""):
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print(f"PASS  {name}")
+    else:
+        FAIL += 1
+        print(f"FAIL  {name}" + (f"  ← {detail}" if detail else ""))
+
+
+def case(fn):
+    def wrapper():
+        try:
+            fn()
+        except Exception:
+            check(fn.__name__, False, traceback.format_exc(limit=2)[-320:])
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+MY_MAC = "8c:e9:ee:a0:f3:b6"
+GW_MAC = "f8:79:28:cc:fc:e8"
+GW_LLA = "fe80::1"
+MY_LLA = "fe80::14a4:bd2f:fe24:58b9"
+TGT_LLA = "fe80::dead:beef:1"
+TGT_MAC = "02:00:00:00:00:02"
+
+
+@case
+def test_na_structure():
+    """NA 必须是 86 字节（14 以太 + 40 IPv6 + 32 ICMPv6）。"""
+    pkt = ipv6.build_na(MY_MAC, TGT_MAC, GW_LLA, TGT_LLA, GW_LLA, MY_MAC)
+    raw = bytes(pkt)
+    check("NA 长度 = 86 字节", len(raw) == 86, f"实际 {len(raw)}")
+    check("ICMPv6 类型 = 136（NA）", pkt["ICMPv6ND_NA"].type == 136)
+    check("tgt 正确", pkt["ICMPv6ND_NA"].tgt == GW_LLA)
+    check("O=1（允许覆盖缓存）", pkt["ICMPv6ND_NA"].O == 1)
+    check("S=0（非请求应答）", pkt["ICMPv6ND_NA"].S == 0)
+    check("携带的是期望 MAC",
+          pkt["ICMPv6NDOptDstLLAddr"].lladdr == MY_MAC)
+    check("以太头 src 未被改写", pkt["Ether"].src == MY_MAC)
+    check("IPv6 目的 = 目标 LLA", pkt["IPv6"].dst == TGT_LLA)
+
+
+@case
+def test_ns_reply_solicited():
+    """代理应答必须置 S=1，否则对方不认。"""
+    pkt = ipv6.build_ns_reply(MY_MAC, TGT_MAC, GW_LLA, TGT_LLA, GW_LLA, MY_MAC)
+    check("NS 应答 S=1", pkt["ICMPv6ND_NA"].S == 1)
+    check("NS 应答 O=1", pkt["ICMPv6ND_NA"].O == 1)
+
+
+@case
+def test_restore_frames_use_real_mac():
+    """回填帧必须携带真实 MAC，否则等于没恢复。"""
+    pkt = ipv6.build_na(GW_MAC, TGT_MAC, GW_LLA, TGT_LLA, GW_LLA, GW_MAC)
+    check("回填帧携带真实网关 MAC",
+          pkt["ICMPv6NDOptDstLLAddr"].lladdr == GW_MAC)
+    check("回填帧以太 src 是网关 MAC", pkt["Ether"].src == GW_MAC)
+
+
+@case
+def test_multicast_guard():
+    """结构性保险：任何组播/广播目的地址都必须被拒绝。"""
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    env = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                     my_lla=MY_LLA, prefixes=["2409::/64"])
+    b = ipv6.NdpBlocker(FakeNI(), env, "192.168.1.9", TGT_MAC, TGT_LLA)
+
+    blocked = []
+    for dst in (ipv6.ALL_NODES_MAC, ipv6.MDNS_MAC, ipv6.BROADCAST_MAC,
+                "01:00:5e:00:00:01"):
+        pkt = ipv6.build_na(MY_MAC, dst, GW_LLA, TGT_LLA, GW_LLA, MY_MAC)
+        try:
+            b._send(pkt)
+            blocked.append(dst)
+        except ipv6.core.BlockError:
+            pass
+    check("四种组播/广播地址全部被拒", not blocked, f"漏了 {blocked}")
+
+
+@case
+def test_preflight_rejects_incomplete():
+    """缺任何一项都必须拒绝启动，不给「试试看」的机会。"""
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    good = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                      my_lla=MY_LLA, prefixes=["2409::/64"])
+    ok, _ = ipv6.NdpBlocker(FakeNI(), good, "192.168.1.9",
+                            TGT_MAC, TGT_LLA).preflight()
+    check("完整信息时 preflight 通过", ok)
+
+    cases = [
+        ("没有 IPv6 路由", ipv6.V6Env(supported=False), TGT_LLA),
+        ("缺网关 MAC", ipv6.V6Env(True, GW_LLA, "", MY_LLA, ["2409::/64"]), TGT_LLA),
+        ("缺目标 LLA", ipv6.V6Env(True, GW_LLA, GW_MAC, MY_LLA, ["2409::/64"]), ""),
+    ]
+    for label, env, tgt in cases:
+        bad, why = ipv6.NdpBlocker(FakeNI(), env, "192.168.1.9",
+                                   TGT_MAC, tgt).preflight()
+        check(f"preflight 拒绝「{label}」", not bad, why)
+
+
+@case
+def test_mdns_query_has_qu_bit():
+    """QU 位必须真的发出去。
+
+    这是实机踩过的坑：写 qclass=0x8001 会被 scapy 的位域吃掉，
+    实际发出 0x1，对方按组播回，本机收不到 —— 看上去就像「没人应答」。
+    """
+    pkt = ipv6.build_mdns_query(MY_LLA)
+    qrs = pkt["DNS"].qd
+    check("含 4 个问题", len(qrs) == 4, f"实际 {len(qrs)}")
+    check("QU 位已置 1", all(getattr(q, "unicastresponse", 0) == 1 for q in qrs))
+    check("qclass 数值仍为 1", all(q.qclass == 1 for q in qrs))
+    check("IPv6 目的 = ff02::fb", pkt["IPv6"].dst == "ff02::fb")
+    check("以太目的 = mDNS 组播 MAC", pkt["Ether"].dst == ipv6.MDNS_MAC)
+    check("源地址 = 本机 LLA", pkt["IPv6"].src == MY_LLA)
+
+
+@case
+def test_parse_neighbors():
+    """邻居表解析：要跳过 00:00 占位行，按地址取值。"""
+    sample = (
+        "\r\n"
+        "接口 7: WLAN\r\n"
+        "Internet 地址                             物理地址            类型\r\n"
+        "----------------------------------------  -----------------  -----------\r\n"
+        "fe80::1                                   f8-79-28-cc-fc-e8  可访问\r\n"
+        "fe80::1                                   00-00-00-00-00-00  无法访问\r\n"
+        "fe80::14a4:bd2f:fe24:58b9                 8c-e9-ee-a0-f3-b6  可访问\r\n"
+    )
+    check("取到网关真实 MAC",
+          ipv6._parse_neighbors(sample, "fe80::1") == "f8:79:28:cc:fc:e8")
+    check("取到本机 MAC",
+          ipv6._parse_neighbors(sample, "FE80::14A4:BD2F:FE24:58B9")
+          == "8c:e9:ee:a0:f3:b6")
+    check("查不存在地址返回 None",
+          ipv6._parse_neighbors(sample, "fe80::ffff") is None)
+
+
+@case
+def test_dual_stack_judgement():
+    """只有 /128 主机路由时不能判定为双栈 —— 这是探测里修过的一个误判。"""
+    no_prefix = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                           my_lla=MY_LLA, prefixes=[])
+    check("无网段前缀 → 不算双栈", not no_prefix.dual_stack)
+
+    with_prefix = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                             my_lla=MY_LLA, prefixes=["2409:8a55::/64"])
+    check("有 /64 前缀 → 判定双栈", with_prefix.dual_stack)
+
+    no_gw = ipv6.V6Env(supported=True, gw_lla="", gw_mac=GW_MAC,
+                       my_lla=MY_LLA, prefixes=["2409:8a55::/64"])
+    check("无网关 → 不算双栈", not no_gw.dual_stack)
+
+
+@case
+def test_valid_mac():
+    check("合法 MAC", ipv6._valid_mac("aa:bb:cc:dd:ee:ff"))
+    check("大写也认", ipv6._valid_mac("AA:BB:CC:DD:EE:FF"))
+    check("拒绝空串", not ipv6._valid_mac(""))
+    check("拒绝短写", not ipv6._valid_mac("aa:bb:cc:dd:ee"))
+    check("拒绝非十六进制", not ipv6._valid_mac("zz:bb:cc:dd:ee:ff"))
+
+
+if __name__ == "__main__":
+    for fn in (
+        test_na_structure,
+        test_ns_reply_solicited,
+        test_restore_frames_use_real_mac,
+        test_multicast_guard,
+        test_preflight_rejects_incomplete,
+        test_mdns_query_has_qu_bit,
+        test_parse_neighbors,
+        test_dual_stack_judgement,
+        test_valid_mac,
+    ):
+        fn()
+
+    print("-" * 32)
+    print(f"共 {PASS + FAIL} 项，失败 {FAIL} 项")
+    sys.exit(1 if FAIL else 0)

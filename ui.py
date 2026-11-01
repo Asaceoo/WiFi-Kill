@@ -40,6 +40,7 @@ OLIVE_BG  = "#E8EFE6"
 
 SAND      = "#C4A785"   # 提示：灰驼
 SAND_BG   = "#F4EDE4"
+SAND_DK   = "#8A7255"   # 提示文字：驼色加深，保证在 SAND_BG 上可读
 
 STONE     = "#9A958E"   # 中性
 STONE_BG  = "#ECEAE5"

@@ -26,7 +26,7 @@ from pathlib import Path
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent

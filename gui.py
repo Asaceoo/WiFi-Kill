@@ -58,6 +58,11 @@ class App(tk.Tk):
         self._closing = False
         self._destroyed = False
         self._opts = (1.5, False)
+        self._ndp_on = False              # IPv6 阻断开关，默认关（两道门之一）
+        self._v6env = None                # ipv6.V6Env，扫描后探测
+        self._ndp = None                  # ipv6.NdpBlocker，同一时刻最多一个
+        self._ndp_ip = ""                 # 当前 IPv6 阻断的目标 IP
+        self._ndp_state = ""              # "" / "ok" / "miss"（探明失败）
         self._tray = None
         self._tray_hinted = False
         self._quitting = False
@@ -218,7 +223,7 @@ class App(tk.Tk):
         if self._banner_state:
             kind, text = self._banner_state
             bgc = ui.SAND_BG if kind != "info" else ui.SAGE_BG
-            fgc = ui.SAND if kind != "info" else ui.SAGE_DK
+            fgc = getattr(ui, "SAND_DK", ui.SAND) if kind != "info" else ui.SAGE_DK
             ui.rrect(cv, P, by, w - P, by + 34, 12, fill=bgc, outline="",
                      tags="static")
             cv.create_text(P + 16, by + 17, text=text, anchor="w",
@@ -472,6 +477,19 @@ class App(tk.Tk):
             self._banner_state = ("warn", f"依赖缺失：{msg}")
             self._badge_dot.set(ui.SAND)
             self._status_text = "依赖缺失"
+        elif self._v6env is not None and self._v6env.dual_stack and not self._ndp_on:
+            # 比「未提权」更重要：不说清楚，用户会以为阻断已经生效
+            self._banner_state = ("warn",
+                                  "本网已启用 IPv6 —— 当前阻断只对 IPv4 生效，"
+                                  "可在「设置」开启 IPv6 阻断（实验）")
+            self._badge_dot.set(ui.SAND)
+            self._status_text = "IPv6 未覆盖"
+        elif self._ndp_on and self._v6env is not None and self._v6env.dual_stack:
+            self._banner_state = ("info",
+                                  "IPv6 阻断已启用（实验）：只断经网关的出站，"
+                                  "同时仅支持 1 台目标")
+            self._badge_dot.set(ui.OLIVE)
+            self._status_text = "IPv6 已启用"
         elif not admin:
             self._banner_state = ("info", "当前未以管理员运行；多数网卡仍可发送，失败时再提权")
             self._badge_dot.set(ui.OLIVE)
@@ -538,11 +556,27 @@ class App(tk.Tk):
                 ni.gateway_mac = d.mac
         self._net = ni
         self._devices = devs
+        self._refresh_v6env(ni)
         self._render_net()
         self._render_rows()
+        self._render_banner()      # IPv6 状态会影响横幅，扫描完必须重画
         if not active:
             self.log("二层不可用，改为读取系统 ARP 缓存（可能不完整）", "warn")
         self.log(f"{'主动扫描' if active else '缓存读取'}完成，发现 {len(devs)} 台设备", "ok")
+
+    def _refresh_v6env(self, ni: core.NetInfo):
+        """探测本网段的 IPv6 状况。只读系统路由表，不发包。"""
+        try:
+            import ipv6 as v6
+            self._v6env = v6.probe_env(ni)
+        except Exception as e:
+            self._v6env = None
+            self.log(f"IPv6 探测失败：{e}", "debug")
+            return
+        env = self._v6env
+        if env and env.dual_stack and not self._ndp_on:
+            self.log(f"本网已启用 IPv6（{env.prefixes[0]}），"
+                     f"当前 ARP 阻断对 IPv6 流量无效", "warn")
 
     def _state_of(self, d: core.Device) -> tuple[str, str]:
         if d.note == "网关":
@@ -552,6 +586,10 @@ class App(tk.Tk):
         if d.ip in self._whitelist or d.mac in self._whitelist:
             return "白名单", "wl"
         if self._killer and any(t.ip == d.ip for t in self._killer.targets()):
+            if self._ndp and d.ip == self._ndp_ip:
+                return "阻断中·双栈", "blocked"
+            if self._ndp_state == "miss" and d.ip == self._ndp_ip:
+                return "阻断中·仅v4", "v4only"
             return "阻断中", "blocked"
         return "未阻断", ""
 
@@ -617,6 +655,16 @@ class App(tk.Tk):
             messagebox.showwarning("无法阻断", f"{msg}\n\n请先处理顶部提示。")
             return
 
+        # 第二道门：IPv6 阻断开启时只允许单目标
+        if self._ndp_on and len(picks) > 1:
+            messagebox.showwarning(
+                "IPv6 阻断只支持单目标",
+                "开启 IPv6 阻断后，同时只能阻断 1 台设备。\n\n"
+                "原因：定向投毒需要逐台探明链路本地地址，"
+                "多目标并行会让整网 IPv6 的失控风险不可控。\n"
+                "需要批量阻断时，请先在「设置」里关闭 IPv6 阻断。")
+            return
+
         self._set_busy(True, "正在阻断…")
 
         def work():
@@ -638,17 +686,73 @@ class App(tk.Tk):
             if added and not k.is_active():
                 k.start()
 
+            v6msg = ""
+            if added and self._ndp_on and picks:
+                try:
+                    v6msg = self._start_ndp(k.ni, picks[0])
+                except Exception as e:
+                    self._ndp_state = "miss"
+                    v6msg = f"IPv6 阻断启动异常：{e}"
+
             def done():
                 if added:
                     self.log(f"已阻断 {added} 台", "ok")
                 if skipped:
                     self.log("跳过：" + "，".join(skipped), "warn")
+                if v6msg:
+                    self.log(v6msg, "ok" if self._ndp else "warn")
                 self._render_rows()
+                self._render_banner()
                 for d in picks:
                     self._flash(d.ip)
                 self._set_busy(False)
             self._post(done)
         threading.Thread(target=work, daemon=True).start()
+
+    def _start_ndp(self, ni, dev) -> str:
+        """探明目标 LLA 并启动 IPv6 定向阻断。必须在工作线程里调用。"""
+        import ipv6 as v6
+
+        env = self._v6env
+        if env is None or not env.dual_stack:
+            self._ndp_state = "miss"
+            return "本网未检测到 IPv6，跳过 IPv6 阻断"
+
+        self._stop_ndp()
+        lla, how = v6.find_lla(ni.iface, dev.mac, env.my_lla, sniff_seconds=12.0)
+        if not lla:
+            self._ndp_state = "miss"
+            self._ndp_ip = dev.ip
+            return (f"未能探明 {dev.ip} 的 IPv6 地址（{how}）—— "
+                    f"该设备的 IPv6 流量未阻断，界面已标注「仅v4」")
+
+        blocker = v6.NdpBlocker(ni, env, dev.ip, dev.mac, lla,
+                                interval=self._opts[0])
+        ok, why = blocker.start()
+        if not ok:
+            self._ndp_state = "miss"
+            self._ndp_ip = dev.ip
+            return f"IPv6 定向阻断未启动：{why}"
+
+        self._ndp = blocker
+        self._ndp_ip = dev.ip
+        self._ndp_state = "ok"
+        return f"IPv6 定向阻断已生效：{dev.ip} → {lla}（来源 {how}）"
+
+    def _stop_ndp(self, restore: bool = True):
+        b = self._ndp
+        self._ndp = None
+        self._ndp_ip = ""
+        self._ndp_state = ""
+        if not b:
+            return 0
+        try:
+            n = b.stop(restore=restore)
+            self.log(f"IPv6 阻断已停止，回填 {n} 次", "info")
+            return n
+        except Exception as e:
+            self.log(f"IPv6 阻断停止异常：{e}", "warn")
+            return 0
 
     def do_unblock_all(self):
         if not self._killer or not self._killer.targets():
@@ -659,6 +763,7 @@ class App(tk.Tk):
         self._set_busy(True, "正在恢复…")
 
         def work():
+            self._stop_ndp()
             ok = self._killer.restore_all()
 
             def done():
@@ -674,6 +779,8 @@ class App(tk.Tk):
         sel = list(self.tree.selection())
 
         def work():
+            if self._ndp_ip and self._ndp_ip in sel:
+                self._stop_ndp()
             for ip in sel:
                 self._killer.remove(ip)
             self._post(self._render_rows)
@@ -781,6 +888,7 @@ class App(tk.Tk):
         self._set_busy(True, "正在放行…")
 
         def work():
+            self._stop_ndp()
             n = self._killer.restore_all()
 
             def done():
@@ -814,6 +922,7 @@ class App(tk.Tk):
 
         def work():
             try:
+                self._stop_ndp(restore=restore)
                 if restore and self._killer:
                     self._killer.restore_all()
             except Exception:
@@ -856,6 +965,11 @@ class App(tk.Tk):
         messagebox.showinfo("环境自检", "\n".join(lines))
 
     def _open_settings(self):
+        # 首次扫描可能还没回来，此时 _v6env 是 None。
+        # 不补探一次就会把「IPv6 阻断」误显示为不可用 —— 探测是只读的，几毫秒。
+        if self._v6env is None:
+            self._refresh_v6env(self._net)
+
         win = tk.Toplevel(self)
         win.title("设置")
         win.configure(bg=ui.CARD)
@@ -886,10 +1000,31 @@ class App(tk.Tk):
                        highlightthickness=0, bd=0).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
+        ndp = tk.BooleanVar(value=self._ndp_on)
+        v6_ok = bool(self._v6env and self._v6env.dual_stack)
+        if self._v6env is None:
+            v6_hint = "未能读取本机 IPv6 路由表，此项暂不可用。"
+        elif not v6_ok:
+            v6_hint = "本网未检测到 IPv6 默认路由，此项不可用（不影响 ARP 阻断）。"
+        else:
+            v6_hint = ("本网检测到全局 IPv6。开启后会对单个目标做定向 NDP 投毒，"
+                       "只断经网关的出站流量。\n"
+                       "内置失控保护：阻断期间持续自检，本机 IPv6 异常立即停手回填。")
+        tk.Checkbutton(body, text="启用 IPv6 阻断（实验）—— 同时只能断 1 台",
+                       variable=ndp, bg=ui.CARD, fg=ui.TEXT, font=self.F["small"],
+                       selectcolor=ui.BG, activebackground=ui.CARD,
+                       highlightthickness=0, bd=0,
+                       state=("normal" if v6_ok else "disabled")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        tk.Label(body, text=v6_hint,
+                 bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"],
+                 justify="left", wraplength=430).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         tk.Label(body, text=f"白名单：{core.WHITELIST_FILE.name}\n"
                             f"状态：{core.STATE_FILE.name}（均在程序目录）",
                  bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"], justify="left").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(16, 0))
+            row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
         def save():
             try:
@@ -901,11 +1036,21 @@ class App(tk.Tk):
             if self._killer:
                 self._killer.interval = val
                 self._killer.dry_run = dry.get()
+
+            if ndp.get() != self._ndp_on:
+                self._ndp_on = ndp.get()
+                if not self._ndp_on:
+                    if self._ndp:
+                        threading.Thread(target=self._stop_ndp, daemon=True).start()
+                    self.log("IPv6 阻断已关闭", "info")
+                else:
+                    self.log("IPv6 阻断已启用，仅对下一次阻断生效，且同时只支持 1 台", "warn")
             self.log(f"设置已保存：间隔 {val}s，演练 {'开' if dry.get() else '关'}", "info")
+            self._render_banner()
             win.destroy()
 
         btns = tk.Frame(body, bg=ui.CARD)
-        btns.grid(row=3, column=0, columnspan=3, sticky="e", pady=(20, 0))
+        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(20, 0))
         tk.Button(btns, text="取消", command=win.destroy, relief="flat", bd=0,
                   bg=ui.CARD_ALT, fg=ui.TEXT2, font=self.F["small"],
                   padx=16, pady=6, cursor="hand2").pack(side="right")

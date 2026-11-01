@@ -1,0 +1,47 @@
+name: 功能建议
+description: 想要新能力，或觉得某处可以做得更好。
+title: "[Idea] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前先看一眼 [CHANGELOG](../blob/main/CHANGELOG.md) 和
+        [技术手册的「已知限制」](../blob/main/docs/TECH_MANUAL.md#13-已知限制)——
+        有些做不到的事是物理限制，不是没想到。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 说场景，别说方案。方案可以一起聊。
+      placeholder: 家里网卡的时候，我不知道是谁在占带宽，只能一台台试着断。
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你设想的做法
+      placeholder: 能不能在设备表里加一列实时流量，按占用排序？
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 这个需求属于哪一类
+      options:
+        - 看得清（设备识别、流量统计）
+        - 断得掉（更强的阻断能力）
+        - 跑得久（定时、通知、接口）
+        - 用起来舒服（界面、交互）
+        - 其他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我没有在要求增加任何用于未授权网络的功能
+          required: true

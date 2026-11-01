@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v2.0.2-2563EB" alt="version">
+  <img src="https://img.shields.io/badge/version-v2.1.0-2563EB" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="python">
   <img src="https://img.shields.io/badge/license-仅供学习研究-6B7280" alt="license">
@@ -69,6 +69,9 @@ WiFiKill 是一个 Windows 桌面程序，能列出同一局域网里的所有�
 | 🪟 单实例 | 多开会互相覆盖状态，已用本地端口互斥 |
 | 📌 系统托盘 | 关闭窗口不退出，托盘右键可唤回主界面、一键全部放行、退出 |
 | 🎨 自绘界面 | 莫兰迪配色、圆角卡片、hover/淡入/呼吸灯动效，无第三方 UI 库 |
+| 🌐 IPv6 探测 | 扫描时读系统 IPv6 路由表，判定本网是否有全局 IPv6（只读，不发包） |
+| ⚠️ 覆盖度告警 | 本网有 IPv6 时明确提示「当前阻断只对 IPv4 生效」，不假装断开了 |
+| 🔗 IPv6 定向阻断 | 实验功能：对单个目标做 NDP 投毒，切断经网关的出站流量 |
 
 ---
 
@@ -101,6 +104,48 @@ WiFiKill 做的是同时欺骗两端：
 
 ---
 
+## IPv6：为什么光有 ARP 不够
+
+ARP 是纯 IPv4 协议。而现在国内宽带普遍下发全局 IPv6（RA + SLAAC），
+双栈设备访问双栈网站时会优先选 IPv6（RFC 6724），这些帧直接发给路由器的真实 MAC，
+**根本不经过投毒方**：
+
+```
+                    IPv4（被投毒）
+    目标设备 ──────────────────────► 本机 ──✕ 不转发
+        │
+        └──────────────────────────► 路由器      ← IPv6 直连，本机看不到也拦不住
+```
+
+结果是**静默失效**：界面写着「阻断中」，日志写着「已阻断 1 台」，目标照常上网。
+这比报错更糟，因为用户会相信它。
+
+v2.1.0 起分两层处理：
+
+| 层级 | 做法 | 默认 |
+|---|---|---|
+| **诚实告警** | 扫描时读系统 IPv6 路由表，本网有全局 IPv6 就在顶部挂驼色横幅 + 徽章「IPv6 未覆盖」 | 开启 |
+| **定向阻断** | 设置里手动打开后，对单个目标做 NDP 投毒（`ipv6.py`） | 关闭 |
+
+### 定向阻断的能力边界（重要）
+
+只断**经默认网关的出站流量**。以下情况它管不了，也不假装管：
+
+- 同一链路的 IPv6 直连：投屏、AirDrop、局域网互传 —— 这些不经过网关
+- 目标处于休眠 / 完全静默：拿不到它的链路本地地址，探明失败时状态列显示「阻断中·仅v4」
+- 网络开了客户端隔离：连 ARP 都拿不到目标，更谈不上 IPv6
+
+### 三道失控保护
+
+NDP 比 ARP 危险：一条发往 `ff02::1` 的 NA 就能把全网的网关映射改掉，包括运行本程序的机器。
+
+1. **结构性保险** —— 所有 NA 都走同一个发包出口，该出口拒绝任何组播/广播目的 MAC
+2. **默认关闭 + 单目标** —— 设置里手动开启，且同时只能阻断 1 台
+3. **运行时自检** —— 每次阻断前校验环境，运行中每 5 个周期检查本机到网关的映射，
+   一旦发现异常立即停手并回填真实映射
+
+---
+
 ## 架构
 
 <p align="center">
@@ -112,8 +157,9 @@ WiFiKill 做的是同时欺骗两端：
 | `gui.py` | 表现层。Canvas 自绘主窗口，所有耗时操作走工作线程，结果经队列回主线程 |
 | `ui.py` | 视觉层。莫兰迪色板、圆角绘制、Canvas 按钮（hover/press 插值动画）、呼吸灯、流动进度条 |
 | `tray.py` | 系统托盘。纯 ctypes 调 `Shell_NotifyIcon`，独立线程跑消息循环，零第三方依赖 |
+| `ipv6.py` | IPv6 层。环境探测、链路本地地址探明、定向 NDP 投毒与失控保护 |
 | `core.py` | 逻辑层。设备发现、报文构造、阻断会话、状态持久化、单实例锁 |
-| `tests/` | 边界与故障路径测试（18 项断言） |
+| `tests/` | 边界与故障路径测试（18 项）+ IPv6 报文级测试（34 项） |
 | `selftest.py` | GUI 端到端自检（28 项断言，会驱动真实界面） |
 | `installer/` | Inno Setup 脚本与简体中文语言文件，产出安装版 |
 | `build.py` | 一键构建：版本自增 → 文档版本同步 → 打包 → 出三个产物 |
@@ -213,8 +259,12 @@ python -m venv .buildenv
 
 ### 设置
 
-右上「设置」可改重发间隔（0.5–10 秒）与演练模式。
+右上「设置」可改重发间隔（0.5–10 秒）、演练模式，以及 **IPv6 阻断（实验）**。
+
 间隔越小越稳定，但流量越大；默认 1.5 秒足够。
+
+IPv6 阻断默认关闭，且只有在本网检测到全局 IPv6 时才能勾选。
+勾上后同时只能阻断 1 台设备 —— 这是刻意的限制，不是 bug。
 
 ### 系统托盘
 
@@ -297,9 +347,9 @@ A：PyInstaller 单文件 + 网络扫描 + 提权是常见误报特征。源码�
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.0.2** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.0.2 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.0.2 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.1.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.1.0 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.1.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
 
 版本号由 `build.py` 自动递增，三份文档的版本会随每次构建同步更新。
 
@@ -321,11 +371,13 @@ WiFi-Kill/
 ├── core.py               逻辑层：发现 / 投毒 / 状态 / 单实例锁
 ├── gui.py                表现层：主窗口与交互编排
 ├── ui.py                 视觉层：色板、圆角、按钮动画
+├── ipv6.py               IPv6 层：探测 / 探明 / NDP 投毒
 ├── tray.py               系统托盘（纯 ctypes）
 ├── build.py              一键构建 + 版本自增
 ├── versions.json         版本真源
 ├── selftest.py           GUI 端到端自检（28 项）
 ├── tests/test_edge.py    边界与故障路径测试（18 项）
+├── tests/test_ipv6.py    IPv6 报文级测试（34 项，CI 可跑）
 ├── tools/make_images.py  概念图生成
 ├── installer/
 │   ├── WiFiKill.iss      Inno Setup 脚本
@@ -336,6 +388,7 @@ WiFi-Kill/
 │   └── images/
 ├── .github/workflows/    推 tag 自动构建发布
 ├── WiFiKill.spec         PyInstaller 配置
+├── CHANGELOG.md          更新日志
 └── LICENSE.txt
 ```
 
@@ -344,6 +397,9 @@ WiFi-Kill/
 ```bash
 # 跑边界测试（不碰真实设备）
 python tests/test_edge.py
+
+# 跑 IPv6 报文级测试（不发包，CI 也跑这个）
+python tests/test_ipv6.py
 
 # 跑 GUI 自检（会驱动真实窗口，注入一台"幽灵设备"，不影响任何人）
 python selftest.py

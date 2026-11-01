@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
 datas = [('wifikill.ico', '.')]
-hiddenimports = ['tray', 'ui']
+hiddenimports = ['tray', 'ui', 'ipv6']
 datas += collect_data_files('scapy')
 hiddenimports += collect_submodules('scapy')
 
