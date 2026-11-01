@@ -7,7 +7,7 @@
 **局域网设备发现与 ARP 阻断工具**
 Windows GUI · 单文件免安装 · 不依赖手机 ROOT · 莫兰迪自绘界面
 
-<img src="https://img.shields.io/badge/version-v2.3.0-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.3.1-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4" alt="platform">
 <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="python">
 <img src="https://img.shields.io/badge/license-仅供学习研究-6B7280" alt="license">
@@ -28,6 +28,22 @@ Windows GUI · 单文件免安装 · 不依赖手机 ROOT · 莫兰迪自绘界�
 > **作者不对任何滥用行为承担责任。下载、运行即表示你已理解并接受上述风险。**
 >
 > 如果你不确定某个网络是否"属于你"，那它就不属于你。
+
+---
+
+## 🛡️ 本版安全硬化（v2.3.1 · 三视角对抗性审查收敛）
+
+基于「工具实现者 / 审查者 / AI 使用方」三视角对抗审查 + **真实报错闭环** + 清单兜底校验，本轮收敛 5 项：
+
+| # | 视角 | 收敛点 | 效果 |
+|---|---|---|---|
+| **F1** | 审查者 | 受保护设备拦截**下沉到 API 层**（`core.Killer.add` 直接拒绝网关/本机） | 此前只靠 GUI 过滤，任何直接调用 `core` 的代码路径都能绕过；现在 IP 或 MAC 命中网关/本机任一即拒 |
+| **F2** | 审查者 | `log()` / `set_status()` 在非主线程经 `after_idle` 回投主线程 | 杜绝 worker 线程直触 Tk 控件偶发的 `TclError` 崩溃 |
+| **F3** | 实现者 | 单目标「阻断选中」也过白名单 | 堵住全阻断过滤、单目标不过滤的单点绕过 |
+| **F4** | AI 使用方 | 应用内弹窗加免责声明（环境自检 + 设置窗口） | 合规可见，不再只在文档里 |
+| **F5** | 实现者 | 窗口销毁后的回调改走 `Anim` 调度器 | 销毁后裸 `after` 不再抛 `TclError` |
+
+> 常规验证：边界 **27/27** + IPv6 报文 **34/34** 全绿；真实局域网对在线设备阻断抓包捕获毒化帧 → `restore_all` → 循环停止 → 恢复后 2s 内零新增毒化帧 → 重扫目标仍可发现（设备未被打挂）。
 
 ---
 
@@ -95,6 +111,10 @@ WiFiKill 做的是同时欺骗两端：
 
 投毒需要周期性重发（默认 1.5 秒），因为 ARP 缓存会超时刷新。
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/flow.png" alt="阻断数据流概念图" width="100%">
+</p>
+
 ## IPv6：为什么光有 ARP 不够
 
 ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC），
@@ -144,7 +164,7 @@ ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC�
 | `tray.py` | 系统托盘。纯 ctypes 调 `Shell_NotifyIcon`，独立线程跑消息循环，零第三方依赖 |
 | `ipv6.py` | IPv6 层。环境探测、链路本地地址探明、定向 NDP 投毒与失控保护 |
 | `core.py` | 逻辑层。设备发现、报文构造、阻断会话、状态持久化、单实例锁 |
-| `tests/` | 边界与故障路径测试（23 项）+ IPv6 报文级测试（34 项） |
+| `tests/` | 边界与故障路径测试（27 项）+ IPv6 报文级测试（34 项） |
 | `selftest.py` | GUI 端到端自检（28 项，会驱动真实界面） |
 | `installer/` | Inno Setup 脚本与简体中文语言文件，产出安装版 |
 | `build.py` | 一键构建：语义化版本自增 → 文档版本同步 → 打包 → 出三个产物 |
@@ -155,10 +175,11 @@ ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC�
   <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/safety.png" alt="安全护栏" width="100%">
 </p>
 
-1. **网关保护** —— 目标列表里永远剔除网关（**单目标与全阻断两条路径都强制**）；
-   确实要断网关必须改代码，GUI 不提供开关。
+1. **网关/本机保护（API 层强制）** —— 受保护设备拦截已下沉到 `core.Killer.add`：
+   只要目标的 **IP 或 MAC 任一命中网关/本机**，构造报文前就被 `BlockError` 拒绝（**GUI 与任何调用方都无法绕过**）。
+   此前只靠 GUI 过滤，存在死角；v2.3.1 经对抗审查补齐。
 2. **本机保护** —— 自己的 IP 不进候选，单目标选择时同样强制跳过。
-3. **白名单** —— 阻断前逐条校验，IP 或 MAC 命中任一即跳过。
+3. **白名单** —— 阻断前逐条校验，**单目标与全阻断两条路径都过滤**，IP 或 MAC 命中任一即跳过。
 4. **崩溃恢复** —— 每次增删目标都原子写 `.wifikill-state.json`；异常退出后重启会主动询问是否恢复。
 
 ---
@@ -329,9 +350,9 @@ A：PyInstaller 单文件 + 网络扫描是常见误报特征。源码在仓库�
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.3.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.3.0 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.3.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.3.1** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.3.1 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.3.1 | 面向开发者，含报文结构、线程模型、测试与打包 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增（`--bump patch|minor|major`），文档版本随构建同步。
@@ -350,7 +371,7 @@ WiFi-Kill/
 ├── build.py              一键构建 + 语义化版本自增
 ├── versions.json         版本真源
 ├── selftest.py           GUI 端到端自检（28 项）
-├── tests/test_edge.py    边界与故障路径测试（23 项）
+├── tests/test_edge.py    边界与故障路径测试（27 项）
 ├── tests/test_ipv6.py    IPv6 报文级测试（34 项，CI 可跑）
 ├── tools/
 │   ├── make_images.py    概念图生成
