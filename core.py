@@ -675,11 +675,36 @@ class Killer:
                     LOG.emit("warn", f"{t.ip} 投毒异常：{e}")
             self._stop.wait(self.interval)
 
+    def _is_protected_target(self, t: Target) -> bool:
+        """目标是否指向网关 / 本机（IP 或 MAC 命中其一即拒绝，与 is_protected 同源）。
+
+        这是安全不变量的 API 层强制：GUI 已经过滤过一次，但这里必须再挡一道 ——
+        任何直接调用 core 的代码路径（插件、脚本、未来的 UI）都不能绕过这道门。
+
+        为什么 IP 与 MAC 要「独立」判定（对抗性审查第 4 轮由回归测试逼出）：
+        - 用网关 IP 作目标：to_target 的 psrc=gw_ip，等于告诉全网「网关 IP → 攻击方 MAC」，全家断网。
+        - 用网关 MAC 作目标（IP 随便）：帧的以太 dst 是网关 MAC、且 psrc=gw_ip，
+          网关会收到一条「我自己(gw_ip) 在攻击方 MAC 上」的 ARP 应答，污染网关自身映射。
+        - 本机同理。所以只要 IP 或 MAC 任一命中网关/本机，就必须拒绝。
+        """
+        ni = self.ni
+        t_mac = (t.mac or "").lower()
+        bad_ips = {ni.gateway_ip, ni.my_ip}
+        bad_macs = {(ni.gateway_mac or "").lower(), (ni.my_mac or "").lower()}
+        if t.ip in bad_ips:
+            return True
+        if t_mac and t_mac in bad_macs:
+            return True
+        return False
+
     def add(self, t: Target) -> None:
         if not self._started and not self.dry_run:
             code, _ = l2_check()
             if code != "ok":
                 raise BlockError("二层不可用，无法阻断")
+        # 安全不变量在 API 层强制：网关 / 本机在任何路径下都不可被阻断。
+        if self._is_protected_target(t):
+            raise BlockError("受保护设备（网关/本机）不可被阻断")
         self._frames(t, restore=False)   # 先验证报文可构造
         with self._lock:
             self._targets[t.key()] = t

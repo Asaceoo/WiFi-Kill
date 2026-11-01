@@ -210,11 +210,43 @@ def t_protected_device():
     check("仅选网关 → 无可阻断目标", not picks2)
 
 
+@case
+def t_protected_api():
+    """对抗性审查第 4 轮（三视角）：安全不变量必须在 API 层强制。
+
+    之前 is_protected 只在 GUI 过滤，core.Killer.add() 会直接接受网关并构造投毒帧
+    （已用真实 trace 复现：dry_run 下 Killer.add(gateway) 被接受、队列 +1）。
+    现在 add() 必须自己拒绝受保护目标。
+    """
+    k = core.Killer(fake_net(), dry_run=True)
+    # 用网关 IP+MAC 直接走 API
+    try:
+        k.add(core.Target("10.0.0.1", "aa:bb:cc:dd:ee:02"))
+        check("API 拒绝网关(按 ip+mac)", False, "网关被接受并构造投毒帧")
+    except core.BlockError:
+        check("API 拒绝网关(按 ip+mac)", True)
+    # 用本机 IP+MAC
+    try:
+        k.add(core.Target("10.0.0.2", "aa:bb:cc:dd:ee:01"))
+        check("API 拒绝本机(按 ip+mac)", False, "本机被接受并构造投毒帧")
+    except core.BlockError:
+        check("API 拒绝本机(按 ip+mac)", True)
+    # 仅 MAC 命中网关（IP 不同）也必须拒绝：双键判定
+    try:
+        k.add(core.Target("10.0.0.99", "aa:bb:cc:dd:ee:02"))
+        check("API 拒绝(仅网关 MAC 命中)", False, "仅 MAC 命中网关却被接受")
+    except core.BlockError:
+        check("API 拒绝(仅网关 MAC 命中)", True)
+    # 普通设备正常入队
+    k.add(core.Target("10.0.0.9", "aa:bb:cc:dd:ee:09"))
+    check("普通设备可正常入队", len(k.targets()) == 1, str(k.targets()))
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
                t_whitelist_mac, t_restore_clears, t_stop_is_clean,
-               t_logger_isolation, t_protected_device):
+               t_logger_isolation, t_protected_device, t_protected_api):
         fn()
 
     print("\n=========== 边界测试 ===========")

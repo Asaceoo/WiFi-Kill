@@ -66,6 +66,7 @@ class App(tk.Tk):
         self._aliases: dict[str, str] = core.load_aliases()
         self._closing = False
         self._destroyed = False
+        self._main_thread = threading.current_thread()  # log/set_status 必须回主线程
         self._opts = (1.5, False)
         self._ndp_on = False              # IPv6 阻断开关，默认关（两道门之一）
         self._v6env = None                # ipv6.V6Env，扫描后探测
@@ -484,7 +485,7 @@ class App(tk.Tk):
             except Exception:
                 return
             if state["a"] < 1.0:
-                self.after(16, tick)
+                self._ui.after(16, tick)
         tick()
 
     def _flash(self, ip: str):
@@ -492,7 +493,7 @@ class App(tk.Tk):
             if self.tree.exists(ip):
                 tags = [t for t in self.tree.item(ip, "tags") if t != "flash"]
                 self.tree.item(ip, tags=tuple(tags + ["flash"]))
-                self.after(520, lambda: self._unflash(ip))
+                self._ui.after(520, lambda: self._unflash(ip))
         except Exception:
             pass
 
@@ -510,6 +511,16 @@ class App(tk.Tk):
         self._q.put(("log", level, msg))
 
     def log(self, msg: str, level: str = "info"):
+        # 线程安全：网络线程（do_block/do_unblock/do_quit 的 work() 等）也会调 log，
+        # 必须经过主线程投递，否则并发触碰 Tk Text 会崩溃或产生 "invalid command name"。
+        if threading.current_thread() is not self._main_thread:
+            try:
+                self.after_idle(lambda: self.log(msg, level))
+            except Exception:
+                pass
+            return
+        if self._destroyed:
+            return
         self.logtext.configure(state="normal")
         self.logtext.tag_remove("fresh", "1.0", "end")
         self.logtext.insert("end", f"{time.strftime('%H:%M:%S')}   {msg}\n", level)
@@ -557,6 +568,14 @@ class App(tk.Tk):
     # ------------------------------------------------------------ 状态
 
     def set_status(self, text: str):
+        # Tk 控件不是线程安全的：worker 线程直接改 canvas 会偶发 TclError / 损坏。
+        # 非主线程一律投递回主线程执行（after_idle 在控件销毁时会抛错，已吞掉）。
+        if threading.current_thread() is not self._main_thread:
+            try:
+                self.after_idle(lambda: self.set_status(text))
+            except Exception:
+                pass
+            return
         self._status_text = text
         try:
             self.canvas.itemconfig("badgetext", text=text)
@@ -889,7 +908,7 @@ class App(tk.Tk):
             if not ips:
                 return
             by_ip = {d.ip: d for d in self._devices}
-            # 安全阀：单目标路径同样必须剔除网关与本机（core.is_protected）。
+            # 安全阀 1：单目标路径同样必须剔除网关与本机（core.is_protected）。
             # 网关被断 = 全家断网；本机被断 = 自己失联。与「全阻断」的保护一致。
             picks = [by_ip[i] for i in ips
                      if i in by_ip and not core.is_protected(by_ip[i])]
@@ -897,11 +916,25 @@ class App(tk.Tk):
                                  if i in by_ip and core.is_protected(by_ip[i])]
             if skipped_protected:
                 self.log("已跳过受保护设备（网关/本机）：" + "、".join(skipped_protected), "warn")
+            # 安全阀 2：白名单设备不可被阻断（与「全阻断」保持一致，避免单点绕过）。
+            picks = [d for d in picks
+                     if d.ip not in self._whitelist and d.mac not in self._whitelist]
+            skipped_wl = [i for i in ips
+                          if i in by_ip and not core.is_protected(by_ip[i])
+                          and (i in self._whitelist or by_ip[i].mac in self._whitelist)]
+            if skipped_wl:
+                self.log("已跳过白名单设备：" + "、".join(skipped_wl), "warn")
             if not picks:
-                messagebox.showwarning(
-                    "受保护设备",
-                    "网关与本机不能被阻断。\n"
-                    "阻断网关会切断整个网络，阻断本机会让自己失联。")
+                if skipped_wl and not skipped_protected:
+                    messagebox.showwarning(
+                        "白名单保护",
+                        "所选设备都在白名单中，已被自动跳过。\n"
+                        "白名单用于保护重要设备不被误阻断。")
+                else:
+                    messagebox.showwarning(
+                        "受保护设备",
+                        "网关与本机不能被阻断。\n"
+                        "阻断网关会切断整个网络，阻断本机会让自己失联。")
                 return
 
         code, msg = core.l2_check()
@@ -1260,6 +1293,9 @@ class App(tk.Tk):
             f"本机        {ni.my_ip or '—'}  {ni.my_mac or ''}",
             f"网关        {ni.gateway_ip or '—'}  {ni.gateway_mac or ''}",
             f"网段        {ni.cidr or '—'}",
+            "",
+            "⚠ 免责声明：本工具仅供你在自己拥有或已获授权的网络上进行",
+            "学习研究。阻断他人设备可能违反法律法规与网络使用条款。",
         ]
         messagebox.showinfo("环境自检", "\n".join(lines))
 
@@ -1324,6 +1360,13 @@ class App(tk.Tk):
                             f"状态：{core.STATE_FILE.name}（均在程序目录）",
                  bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"], justify="left").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+
+        tk.Label(body,
+                 text="免责声明：本工具仅用于你拥有或已获授权的网络的学习研究。"
+                      "阻断他人设备可能违反法律法规与网络使用条款。",
+                 bg=ui.CARD, fg=ui.SAND_DK, font=self.F["tiny"],
+                 justify="left", wraplength=430).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
 
         def save():
             try:
