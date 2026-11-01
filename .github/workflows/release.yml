@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install scapy pyinstaller
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 自检（边界测试）
+        run: python tests/test_edge.py
+
+      - name: 构建三种产物
+        run: python build.py --no-bump
+
+      - name: 列出产物
+        run: Get-ChildItem dist | Format-Table Name,Length
+        shell: pwsh
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WiFiKill ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 三种形态，按需选择
+
+            | 形态 | 文件 | 说明 |
+            |---|---|---|
+            | **安装版** | `WiFiKill-${{ github.ref_name }}-setup.exe` | 中文安装向导，带开始菜单/桌面快捷方式与卸载 |
+            | **单文件版** | `WiFiKill-${{ github.ref_name }}.exe` | 绿色单文件，拷走即用 |
+            | **打包版** | `WiFiKill-${{ github.ref_name }}-portable.zip` | exe + 用户手册 + 技术手册 + 许可 |
+
+            ## 安装前必读
+
+            1. 先装 [Npcap](https://npcap.com/#download)，安装时**务必勾选 `WinPcap API-compatible Mode`**
+            2. 单文件版/打包版请放在可写目录（不要放 `C:\Program Files`）
+            3. 首次启动会解包，约 2–3 秒属正常
+
+            ## ⚠️ 免责声明
+
+            本工具仅用于自有网络或已获书面授权的安全测试、教学演示。
+            未经授权干扰他人网络通信可能违反《网络安全法》第二十七条、
+            《治安管理处罚法》第二十九条，情节严重可触犯《刑法》第二百八十五条、第二百八十六条。
+            **作者不对任何滥用行为承担责任。**
+          files: |
+            dist/WiFiKill-v*.exe
+            dist/WiFiKill-v*-portable.zip
+
+      - name: 保留构建产物（便于排查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiFiKill-build
+          path: dist/*
+          retention-days: 7
