@@ -65,9 +65,35 @@ def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), detail))
 
 
+STATE_BACKUP: list[tuple[Path, bytes | None]] = []
+
+
+def isolate_state():
+    """把外部状态文件挪开：上一轮中断残留的 whitelist.txt 会让断言结果
+    取决于"上次跑到哪一步"，这是实测踩过的坑。"""
+    for f in (core.WHITELIST_FILE, core.STATE_FILE):
+        try:
+            STATE_BACKUP.append((f, f.read_bytes() if f.exists() else None))
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def restore_state():
+    for f, data in STATE_BACKUP:
+        try:
+            if data is None:
+                f.unlink(missing_ok=True)
+            else:
+                f.write_bytes(data)
+        except Exception:
+            pass
+
+
 def run():
+    isolate_state()
     app = gui.App()
-    app.geometry("1104x808+40+40")
+    app.geometry("1220x900+40+40")
     steps = []
 
     def step(fn, delay):
@@ -204,6 +230,7 @@ def run():
         app.after(3400, s5), app.after(3800, s6), app.after(4300, s6b),
         app.after(5600, s7)))
     app.mainloop()
+    restore_state()
 
 
 if __name__ == "__main__":

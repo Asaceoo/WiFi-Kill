@@ -110,9 +110,13 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 
 def _ico_path() -> str:
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    p = os.path.join(base, "wifikill.ico")
-    return p if os.path.exists(p) else ""
+    try:
+        import core
+        return core.resource_path("wifikill.ico")
+    except Exception:
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        p = os.path.join(base, "wifikill.ico")
+        return p if os.path.exists(p) else ""
 
 
 class TrayIcon:

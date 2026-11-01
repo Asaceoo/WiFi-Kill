@@ -26,7 +26,7 @@ from pathlib import Path
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -35,6 +35,7 @@ else:
 
 STATE_FILE = APP_DIR / ".wifikill-state.json"
 WHITELIST_FILE = APP_DIR / "whitelist.txt"
+ALIAS_FILE = APP_DIR / "aliases.json"   # 设备备注：mac/ip → 名字
 LOCK_PORT = 51999
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -70,6 +71,16 @@ class Logger:
 
 
 LOG = Logger()
+
+
+def resource_path(name: str) -> str:
+    """取随包分发的资源文件路径。
+
+    PyInstaller onefile 会把资源解到 sys._MEIPASS，源码运行时就在脚本旁边。
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, name)
+    return path if os.path.exists(path) else ""
 
 
 def _run_hidden(cmd: list[str], encoding: str) -> str:
@@ -525,6 +536,27 @@ def load_whitelist() -> set[str]:
         if line and not line.startswith("#"):
             out.add(line)
     return out
+
+
+def load_aliases() -> dict[str, str]:
+    """读设备备注。键是 MAC 或 IP，值是用户起的名字。"""
+    try:
+        data = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (data or {}).items():
+        if isinstance(v, str) and v.strip():
+            out[str(k).lower()] = v.strip()
+    return out
+
+
+def save_aliases(items: dict[str, str]) -> None:
+    """原子写备注，避免崩溃留下半个 JSON。"""
+    tmp = ALIAS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, ALIAS_FILE)
 
 
 def save_whitelist(items: set[str]):

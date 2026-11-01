@@ -44,9 +44,24 @@ README_VER_RE = re.compile(r"(\| 程序 \| \*\*v)(\d+\.\d+\.\d+)(\*\*)")
 README_BADGE_RE = re.compile(r"(badge/version-v)(\d+\.\d+\.\d+)")
 
 
-def bump(v: str) -> str:
+def bump(v: str, level: str = "patch") -> str:
+    """语义化递增：patch 修 bug，minor 加功能，major 破坏性变更。
+
+    手册版本跟着程序走：minor 及以上时手册也升 minor，否则只升 patch。
+    """
     major, minor, patch = (int(x) for x in v.split("."))
-    return f"{major}.{minor}.{patch + 1}"
+    if level == "major":
+        major, minor, patch = major + 1, 0, 0
+    elif level == "minor":
+        major, minor, patch = major, minor + 1, 0
+    else:
+        patch += 1
+    return f"{major}.{minor}.{patch}"
+
+
+def bump_docs(v: dict, level: str) -> None:
+    for key in ("user_manual", "tech_manual"):
+        v[key] = bump(v[key], "minor" if level in ("minor", "major") else "patch")
 
 
 def load_versions() -> dict:
@@ -238,14 +253,15 @@ def make_setup(v: dict) -> Path | None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-bump", action="store_true")
+    ap.add_argument("--bump", choices=("patch", "minor", "major"),
+                    default="patch", help="版本递增档位，默认 patch")
     ap.add_argument("--zip-only", action="store_true")
     args = ap.parse_args()
 
     v = load_versions()
     if not args.no_bump:
-        v["app"] = bump(v["app"])
-        v["user_manual"] = bump(v["user_manual"])
-        v["tech_manual"] = bump(v["tech_manual"])
+        v["app"] = bump(v["app"], args.bump)
+        bump_docs(v, args.bump)
         v["build"] = int(v.get("build", 0)) + 1
     v["released"] = dt.date.today().isoformat()
     save_versions(v)

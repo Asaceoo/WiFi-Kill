@@ -11,6 +11,7 @@ gui.py — WiFiKill 图形界面（Canvas 自绘 · 莫兰迪风格）
 
 from __future__ import annotations
 
+import math
 import queue
 import sys
 import threading
@@ -18,7 +19,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import core
 import ui
@@ -38,15 +39,22 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"WiFiKill {core.APP_VERSION}")
-        self.geometry("1104x808")
-        self.minsize(960, 680)
+        self.geometry("1320x980")
+        self.minsize(1180, 860)
         self.configure(bg=ui.BG)
+        ico = core.resource_path("wifikill.ico")
+        if ico:
+            try:
+                self.iconbitmap(default=ico)
+            except Exception:
+                pass
 
         fam = pick_family()
+        # 字号按用户反馈第二轮放大：正文 14，辅助 13，最小 12
         self.F = {
-            "h1": (fam, 23), "sub": (fam, 10), "body": (fam, 10),
-            "small": (fam, 9), "tiny": (fam, 8),
-            "k": (fam, 9), "v": (fam, 11), "mono": ("Consolas", 9),
+            "h1": (fam, 32), "sub": (fam, 14), "body": (fam, 14),
+            "small": (fam, 13), "tiny": (fam, 12),
+            "k": (fam, 13), "v": (fam, 16), "mono": ("Consolas", 13),
         }
 
         self._q: queue.Queue = queue.Queue()
@@ -55,6 +63,7 @@ class App(tk.Tk):
         self._net = core.NetInfo()
         self._killer: core.Killer | None = None
         self._whitelist: set[str] = core.load_whitelist()
+        self._aliases: dict[str, str] = core.load_aliases()
         self._closing = False
         self._destroyed = False
         self._opts = (1.5, False)
@@ -67,9 +76,14 @@ class App(tk.Tk):
         self._tray_hinted = False
         self._quitting = False
         self._banner_state: tuple[str, str] | None = None
+        self._ui = ui.Anim(self)
+        self._row_gen = 0
+        self._foot_item = None
+        self._foot_shown = 0
+        self._breath_job = None
         self._status_text = "就绪"
         self._wl_hidden = False
-        self._geo = {"w": 1040, "h": 760, "P": 32}
+        self._geo = {"w": 1300, "h": 940, "P": 36}
 
         self._lock_holder = core.SingleInstance()
         if not self._lock_holder.acquire():
@@ -108,11 +122,11 @@ class App(tk.Tk):
         except Exception:
             pass
         st.configure("M.Treeview", background=ui.CARD, fieldbackground=ui.CARD,
-                     foreground=ui.TEXT, rowheight=34, borderwidth=0,
+                     foreground=ui.TEXT, rowheight=44, borderwidth=0,
                      font=self.F["body"])
         st.configure("M.Treeview.Heading", background=ui.CARD,
                      foreground=ui.TEXT3, font=self.F["tiny"], relief="flat",
-                     padding=(10, 10))
+                     padding=(10, 12))
         st.map("M.Treeview", background=[("selected", ui.SAGE_BG)],
                foreground=[("selected", ui.TEXT)])
         st.map("M.Treeview.Heading", background=[("active", ui.CARD)])
@@ -124,12 +138,13 @@ class App(tk.Tk):
     def _make_tree(self):
         self.tree = ttk.Treeview(self.canvas, style="M.Treeview",
                                  columns=("no", "ip", "mac", "vendor",
-                                          "dtype", "state", "_sp"),
+                                          "dtype", "mark", "state", "_sp"),
                                  show="headings", selectmode="extended")
         heads = {"no": "#", "ip": "IP 地址", "mac": "MAC 地址",
-                 "vendor": "厂商", "dtype": "类型", "state": "状态", "_sp": ""}
-        widths = {"no": 56, "ip": 148, "mac": 176, "vendor": 220,
-                  "dtype": 118, "state": 112, "_sp": 40}
+                 "vendor": "厂商", "dtype": "类型", "mark": "标识",
+                 "state": "状态", "_sp": ""}
+        widths = {"no": 50, "ip": 142, "mac": 168, "vendor": 172,
+                  "dtype": 94, "mark": 120, "state": 106, "_sp": 36}
         for c in heads:
             self.tree.heading(c, text=heads[c], anchor="w")
             self.tree.column(c, width=widths[c], minwidth=widths[c] - 24,
@@ -139,6 +154,7 @@ class App(tk.Tk):
         self.tree.tag_configure("me", foreground=ui.SAGE_DK)
         self.tree.tag_configure("wl", foreground=ui.BLUSH)
         self.tree.tag_configure("flash", background=ui.SAGE_BG)
+        self.tree.tag_configure("v4only", foreground=getattr(ui, "SAND_DK", ui.SAND))
 
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Button-3>", self._on_right)
@@ -219,38 +235,49 @@ class App(tk.Tk):
                        font=self.F["small"], fill=ui.TEXT2,
                        tags=("static", "badgetext"))
 
-        by = 92
+        by = 96
         if self._banner_state:
             kind, text = self._banner_state
             bgc = ui.SAND_BG if kind != "info" else ui.SAGE_BG
             fgc = getattr(ui, "SAND_DK", ui.SAND) if kind != "info" else ui.SAGE_DK
-            ui.rrect(cv, P, by, w - P, by + 34, 12, fill=bgc, outline="",
-                     tags="static")
-            cv.create_text(P + 16, by + 17, text=text, anchor="w",
-                           font=self.F["small"], fill=fgc, tags="static")
+            # 只有内容变了才播滑入，否则每次窗口重排都要重放一遍，很吵
+            sig = (kind, text)
+            fresh = sig != getattr(self, "_banner_sig", None)
+            self._banner_sig = sig
+            dy = -10 if fresh else 0
+            ids = [
+                ui.rrect(cv, P, by + dy, w - P, by + 34 + dy, 12, fill=bgc,
+                         outline="", tags="static"),
+                cv.create_text(P + 16, by + 17 + dy, text=text, anchor="w",
+                               font=self.F["small"], fill=fgc, tags="static"),
+            ]
             if kind == "npcap":
-                cv.create_text(w - P - 16, by + 17, text="打开下载页 →",
-                               anchor="e", font=self.F["small"], fill=fgc,
-                               tags=("static", "bannerlink"))
+                ids.append(cv.create_text(
+                    w - P - 16, by + 17 + dy, text="打开下载页 →",
+                    anchor="e", font=self.F["small"], fill=fgc,
+                    tags=("static", "bannerlink")))
                 cv.tag_bind("bannerlink", "<Button-1>",
                             lambda e: webbrowser.open(NPCAP_URL))
+            if dy:
+                self._ui.after(8, lambda i=list(ids), d=dy: ui.slide_in(cv, i, d, ms=180))
             ny = by + 48
         else:
+            self._banner_sig = None
             ny = 92
 
-        card_h = 100
+        card_h = 134
         ui.card(cv, P, ny, w - P, ny + card_h, 16, tags="static")
         cols = [("iface", "网卡"), ("ip", "本机"), ("gw", "网关"), ("cidr", "网段")]
         inner_w = (w - P * 2 - 44) / 4
         self._net_items = {}
         for i, (key, cap) in enumerate(cols):
             cx = P + 22 + i * inner_w
-            cv.create_text(cx, ny + 26, text=cap, anchor="w",
+            cv.create_text(cx, ny + 30, text=cap, anchor="w",
                            font=self.F["k"], fill=ui.TEXT3, tags="static")
-            main = cv.create_text(cx, ny + 52, text="—", anchor="w",
+            main = cv.create_text(cx, ny + 68, text="—", anchor="w",
                                   width=inner_w - 14, font=self.F["v"],
                                   fill=ui.TEXT, tags="static")
-            sub = cv.create_text(cx, ny + 76, text="", anchor="w",
+            sub = cv.create_text(cx, ny + 102, text="", anchor="w",
                                  width=inner_w - 14, font=self.F["small"],
                                  fill=ui.TEXT3, tags="static")
             self._net_items[key] = (main, sub)
@@ -283,10 +310,10 @@ class App(tk.Tk):
             self._shimmer.stop()
             self._shimmer.start()
 
-        tbl_y = ty + 60
+        tbl_y = ty + 72
         # 剩余空间优先给表格，日志卡 104~140 自适应
         avail = max(320, h - tbl_y - 88)
-        log_h = int(min(140, max(104, avail * 0.25)))
+        log_h = int(min(170, max(126, avail * 0.25)))
         tbl_h = max(170, avail - log_h - 14)
         ui.card(cv, P, tbl_y, w - P, tbl_y + tbl_h, 16, tags="static")
         self.tree.place(x=P + 14, y=tbl_y + 12, width=w - P * 2 - 40,
@@ -304,9 +331,12 @@ class App(tk.Tk):
         cv = self.canvas
         cv.delete("footer")
         g = self._geo
-        cv.create_text(g["P"], g["h"] - 26, text=self._footer_text(), anchor="w",
-                       font=self.F["small"], fill=ui.TEXT3, tags=("static", "footer"))
-        cv.create_text(g["w"] - g["P"], g["h"] - 26, text=f"v{core.APP_VERSION}",
+        self._foot_item = cv.create_text(
+            g["P"], g["h"] - 26, text=self._footer_text(), anchor="w",
+            font=self.F["small"], fill=ui.TEXT3, tags=("static", "footer"))
+        self._draw_chips()
+        vx = getattr(self, "_chips_left", g["w"] - g["P"]) - 18
+        cv.create_text(vx, g["h"] - 26, text=f"v{core.APP_VERSION}",
                        anchor="e", font=self.F["small"], fill=ui.TEXT3,
                        tags=("static", "footer"))
 
@@ -322,11 +352,104 @@ class App(tk.Tk):
                                                b.y + b.h, b.r))
         self.canvas.coords(b.label, b.x + b.w / 2, b.y + b.h / 2)
 
-    def _footer_text(self) -> str:
+    def _draw_chips(self):
+        """页脚右侧的状态徽章排：在线 / 阻断 / IPv6。
+
+        数值变化时向上弹一下再落回 —— 比干巴巴的数字更容易注意到变化。
+        """
+        cv = self.canvas
+        cv.delete("chips")
+        g = self._geo
+        y = g["h"] - 26
+
+        n_online = len(self._devices)
+        n_block = len(self._killer.targets()) if self._killer else 0
+        env = self._v6env
+        chips = [(f"在线 {n_online}", ui.SAGE_BG, ui.SAGE_DK)]
+        if n_block:
+            chips.append((f"阻断 {n_block}", ui.ROSE_BG, ui.ROSE_DK))
+        if env is not None and env.dual_stack:
+            on = self._ndp_on
+            chips.append(("IPv6 已接管" if on else "IPv6 未覆盖",
+                          ui.SAGE_BG if on else ui.SAND_BG,
+                          ui.SAGE_DK if on else getattr(ui, "SAND_DK", ui.SAND)))
+
+        font = tkfont.Font(font=self.F["small"])
+        x = g["w"] - g["P"]
+        ids: list[int] = []
+        for text, bg, fg in reversed(chips):
+            tw = font.measure(text) + 26
+            x -= tw
+            ids.append(ui.rrect(cv, x, y - 12, x + tw, y + 12, 12,
+                                fill=bg, outline="", tags=("chips",)))
+            ids.append(cv.create_text(x + tw / 2, y, text=text,
+                                      font=self.F["small"], fill=fg,
+                                      tags=("chips",)))
+            x -= 10
+
+        self._chips_left = x
+        vals = (n_online, n_block, self._ndp_on)
+        if getattr(self, "_chip_vals", None) not in (None, vals) and ids:
+            self._ui.after(10, lambda i=list(ids): self._chip_pop(i))
+        self._chip_vals = vals
+
+    def _chip_pop(self, ids):
+        """徽章弹一下：先整体上移 3px，再分两步落回。"""
+        try:
+            for oid in ids:
+                self.canvas.move(oid, 0, -3)
+        except tk.TclError:
+            return
+
+        def back(step=0):
+            if self._destroyed:
+                return
+            try:
+                for oid in ids:
+                    self.canvas.move(oid, 0, 1 if step < 2 else 2)
+            except tk.TclError:
+                return
+            if step < 2:
+                self._ui.after(60, back, step + 1)
+
+        self._ui.after(90, back)
+
+    def _footer_text(self, shown: int | None = None) -> str:
         blocked = len(self._killer.targets()) if self._killer else 0
-        return f"共 {len(self._devices)} 台设备 · 阻断中 {blocked} 台 · 关闭窗口将驻留托盘"
+        total = len(self._devices) if shown is None else shown
+        return f"共 {total} 台设备 · 阻断中 {blocked} 台 · 关闭窗口将驻留托盘"
 
     # ------------------------------------------------------------ 动画
+
+    def _animate_footer(self):
+        """设备总数变化时滚一下数字，比直接跳变更容易注意到。"""
+        target = len(self._devices)
+        start = self._foot_shown
+        if target == start:
+            return
+        self._foot_shown = target
+        steps = 12
+
+        def tick(i: int = 1):
+            if self._destroyed or self._foot_item is None:
+                return
+            t = i / steps
+            val = start + (target - start) * ui.ease_out(t)
+            try:
+                self.canvas.itemconfig(self._foot_item,
+                                       text=self._footer_text(round(val)))
+            except tk.TclError:
+                return
+            if i < steps:
+                self._ui.after(24, tick, i + 1)
+            else:
+                try:
+                    self.canvas.itemconfig(self._foot_item,
+                                           text=self._footer_text())
+                except tk.TclError:
+                    pass
+
+        tick()
 
     def _fade_in(self):
         try:
@@ -558,7 +681,8 @@ class App(tk.Tk):
         self._devices = devs
         self._refresh_v6env(ni)
         self._render_net()
-        self._render_rows()
+        self._render_rows(animate=True)
+        self._animate_footer()
         self._render_banner()      # IPv6 状态会影响横幅，扫描完必须重画
         if not active:
             self.log("二层不可用，改为读取系统 ARP 缓存（可能不完整）", "warn")
@@ -578,13 +702,28 @@ class App(tk.Tk):
             self.log(f"本网已启用 IPv6（{env.prefixes[0]}），"
                      f"当前 ARP 阻断对 IPv6 流量无效", "warn")
 
-    def _state_of(self, d: core.Device) -> tuple[str, str]:
+    def _mark_of(self, d: core.Device) -> str:
+        """标识列：这台设备「是什么」，与阻断状态无关。
+
+        优先级：用户备注 > 角色（网关/本机/白名单）> 随机 MAC / 厂商。
+        """
+        alias = self._aliases.get(d.mac) or self._aliases.get(d.ip)
+        if alias:
+            return alias
         if d.note == "网关":
-            return "网关", "gw"
+            return "网关"
         if d.note == "本机":
-            return "本机", "me"
+            return "本机"
         if d.ip in self._whitelist or d.mac in self._whitelist:
-            return "白名单", "wl"
+            return "白名单"
+        if "随机" in d.vendor:
+            return "随机 MAC"
+        if d.vendor and d.vendor != "—":
+            return d.vendor
+        return "—"
+
+    def _state_of(self, d: core.Device) -> tuple[str, str]:
+        """状态列：这台设备「正被怎样对待」。"""
         if self._killer and any(t.ip == d.ip for t in self._killer.targets()):
             if self._ndp and d.ip == self._ndp_ip:
                 return "阻断中·双栈", "blocked"
@@ -593,24 +732,95 @@ class App(tk.Tk):
             return "阻断中", "blocked"
         return "未阻断", ""
 
-    def _render_rows(self):
+    def _render_rows(self, animate: bool = False):
+        """重画设备表。
+
+        animate=True 仅用于「扫描结果落地」这一处：错峰逐行插入。
+        其余场景必须同步插入 —— 调用方（右键菜单、自检脚本、阻断后刷新）
+        默认渲染完就能立刻选中某行，异步会让这个约定失效。
+        """
+        # 每次重画都换一个世代号：上一轮还没插入完的行必须作废，
+        # 否则连点两次扫描会插出重复行。
+        self._row_gen += 1
+        gen = self._row_gen
         sel = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
+
+        rows = []
         idx = 0
         for d in self._devices:
             state, tag = self._state_of(d)
             if self._wl_hidden and state == "白名单":
                 continue
             idx += 1
-            self.tree.insert("", "end", iid=d.ip, tags=(tag,) if tag else (),
-                             values=(idx, d.ip, d.mac, d.vendor, d.dtype, state, ""))
+            rows.append((d, idx, tag, state, self._mark_of(d)))
+
+        # 行数多时不逐行动画，否则看起来像卡顿
+        if not animate or len(rows) > 24:
+            for d, i, tag, state, mark in rows:
+                self._insert_row(None, d, i, tag, state, mark)
+        else:
+            for n, (d, i, tag, state, mark) in enumerate(rows):
+                self._ui.after(n * 26, self._insert_row, gen, d, i, tag,
+                               state, mark)
+
         for iid in sel:
             if self.tree.exists(iid):
                 self.tree.selection_add(iid)
+
         blocked = len(self._killer.targets()) if self._killer else 0
         if self._badge_dot:
             self._badge_dot.set(ui.ROSE if blocked else ui.OLIVE, pulse=blocked > 0)
+        if blocked:
+            self._start_block_breath()
+        else:
+            self._stop_block_breath()
+        if not self._destroyed:
+            self._draw_chips()
         self._update_buttons()
+
+    def _insert_row(self, gen, d, idx, tag, state, mark="—"):
+        if self._destroyed or (gen is not None and gen != self._row_gen):
+            return
+        try:
+            self.tree.insert("", "end", iid=d.ip,
+                             tags=(tag,) if tag else (),
+                             values=(idx, d.ip, d.mac, d.vendor, d.dtype,
+                                     mark, state, ""))
+        except tk.TclError:
+            pass
+
+    def _start_block_breath(self):
+        """被阻断的行做一次缓慢的底色呼吸，提示「这里正在生效」。"""
+        if self._breath_job or self._destroyed:
+            return
+        state = {"t": 0.0}
+
+        def tick():
+            if self._destroyed:
+                return
+            state["t"] += 0.085
+            k = 0.5 + 0.5 * math.sin(state["t"])
+            col = ui.mix(ui.CARD, ui.ROSE_BG, 0.30 + 0.70 * k)
+            try:
+                self.tree.tag_configure("blocked", background=col)
+            except tk.TclError:
+                return
+            self._breath_job = self._ui.after(70, tick)
+
+        tick()
+
+    def _stop_block_breath(self):
+        if self._breath_job:
+            try:
+                self.after_cancel(self._breath_job)
+            except Exception:
+                pass
+            self._breath_job = None
+        try:
+            self.tree.tag_configure("blocked", background="")
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------ 阻断
 
@@ -814,10 +1024,49 @@ class App(tk.Tk):
         self.menu.add_separator()
         self.menu.add_command(label="复制 IP", command=lambda: self._copy("ip"))
         self.menu.add_command(label="复制 MAC", command=lambda: self._copy("mac"))
+        sel = self.tree.selection()
+        has_alias = any((self._aliases.get(i)) for i in sel)
+        self.menu.add_command(label="设置备注…", command=self._set_alias)
+        if has_alias:
+            self.menu.add_command(label="清除备注", command=self._clear_alias)
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
             self.menu.grab_release()
+
+    def _set_alias(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        by_ip = {d.ip: d for d in self._devices}
+        dev = by_ip.get(sel[0])
+        old = (self._aliases.get(dev.mac) or self._aliases.get(dev.ip, "")) if dev else ""
+        name = simpledialog.askstring("设置备注",
+                                      f"给 {sel[0]} 起个名字（显示在「标识」列）：",
+                                      initialvalue=old, parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if dev:
+            self._aliases.pop(dev.mac, None)
+            self._aliases.pop(dev.ip, None)
+        if name:
+            if dev and dev.mac:
+                self._aliases[dev.mac] = name
+            self._aliases[sel[0]] = name
+        core.save_aliases(self._aliases)
+        self.log(f"已设置备注：{sel[0]} → {name}" if name
+                 else f"已清除备注：{sel[0]}", "ok")
+        self._render_rows()
+
+    def _clear_alias(self):
+        for i in self.tree.selection():
+            self._aliases.pop(i, None)
+            by_ip = {d.ip: d for d in self._devices}
+            if i in by_ip and by_ip[i].mac:
+                self._aliases.pop(by_ip[i].mac, None)
+        core.save_aliases(self._aliases)
+        self._render_rows()
 
     def _wl(self, add: bool):
         by_ip = {d.ip: d for d in self._devices}
@@ -932,6 +1181,11 @@ class App(tk.Tk):
 
     def _finish(self):
         self._destroyed = True
+        self._stop_block_breath()
+        try:
+            self._ui.cancel_all()
+        except Exception:
+            pass
         try:
             self.destroy()
         except Exception:
