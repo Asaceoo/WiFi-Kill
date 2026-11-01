@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ui.py — 视觉层组件：莫兰迪配色、圆角绘制、Canvas 按钮、动画缓动
+
+Tkinter 没有圆角和阴影，这里全部用 Canvas 自绘：
+  - 圆角矩形：smooth 多边形的经典解法
+  - 按钮：整块画在 Canvas 上，逐帧插值颜色做 hover / press 动画
+  - 卡片：在背景 Canvas 上画，内容控件用 place() 摆进去
+"""
+
+from __future__ import annotations
+
+import math
+import tkinter as tk
+
+# ---------------------------------------------------------------- 莫兰迪色板
+
+BG        = "#F2F0EC"   # 页面底：暖白
+CARD      = "#FBFAF7"   # 卡片面
+CARD_ALT  = "#F6F4F0"   # 次级面
+LINE      = "#E4E0D9"   # 分隔线
+LINE_SOFT = "#EDEAE4"   # 更浅的分隔
+SHADOW    = "#E7E3DB"   # 伪阴影
+
+TEXT      = "#3A3733"   # 主文字
+TEXT2     = "#87817A"   # 次文字
+TEXT3     = "#ADA79F"   # 提示文字
+
+SAGE      = "#8C9E93"   # 主色：灰绿
+SAGE_DK   = "#77897E"
+SAGE_BG   = "#E7EDE8"
+
+ROSE      = "#BC8C82"   # 危险：灰玫瑰
+ROSE_DK   = "#A8796F"
+ROSE_BG   = "#F2E6E3"
+
+OLIVE     = "#8FA98B"   # 成功：灰橄榄
+OLIVE_BG  = "#E8EFE6"
+
+SAND      = "#C4A785"   # 提示：灰驼
+SAND_BG   = "#F4EDE4"
+
+STONE     = "#9A958E"   # 中性
+STONE_BG  = "#ECEAE5"
+
+BLUSH     = "#B9A5A0"   # 白名单：灰藕
+BLUSH_BG  = "#EFE8E6"
+
+
+def mix(c1: str, c2: str, t: float) -> str:
+    """颜色线性插值，t=0 取 c1，t=1 取 c2。"""
+    t = max(0.0, min(1.0, t))
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{int(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
+
+
+def ease_out(t: float) -> float:
+    return 1 - (1 - t) ** 3
+
+
+# ---------------------------------------------------------------- 绘图基元
+
+def rrect(cv: tk.Canvas, x0, y0, x1, y1, r=12, **kw):
+    """圆角矩形：把四角拆成重复点交给 smooth 样条。"""
+    r = min(r, abs(x1 - x0) / 2, abs(y1 - y0) / 2)
+    pts = [
+        x0 + r, y0, x1 - r, y0, x1, y0,
+        x1, y0 + r, x1, y1 - r, x1, y1,
+        x1 - r, y1, x0 + r, y1, x0, y1,
+        x0, y1 - r, x0, y0 + r, x0, y0,
+    ]
+    return cv.create_polygon(pts, smooth=True, splinesteps=24, **kw)
+
+
+def card(cv: tk.Canvas, x0, y0, x1, y1, r=16, lift=2, **kw):
+    """画一张带极淡底影的卡片，返回 (阴影ids, 面ids)。"""
+    sh = rrect(cv, x0, y0 + lift, x1, y1 + lift, r,
+               fill=SHADOW, outline="", **kw)
+    face = rrect(cv, x0, y0, x1, y1, r, fill=CARD, outline=LINE, width=1, **kw)
+    return sh, face
+
+
+def hline(cv, x0, x1, y, color=LINE_SOFT):
+    return cv.create_line(x0, y, x1, y, fill=color)
+
+
+# ---------------------------------------------------------------- Canvas 按钮
+
+class CanvasButton:
+    """画在 Canvas 上的按钮：圆角、hover 过渡、按下反馈、禁用态。"""
+
+    _registry: list["CanvasButton"] = []
+
+    def __init__(self, cv: tk.Canvas, text: str, x: int, y: int, w: int, h: int,
+                 command=None, kind: str = "primary", radius: int = 10,
+                 font=("Microsoft YaHei UI", 10), pad: int = 18):
+        self.cv = cv
+        self.text = text
+        self.command = command
+        self.kind = kind
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.r = radius
+        self.font = font
+        self.enabled = True
+        self._hover = 0.0          # 0..1
+        self._press = 0.0
+        self._anim = None
+
+        base, hover, fg, bd = self._palette(kind)
+        self._c_base, self._c_hover, self._c_fg, self._c_bd = base, hover, fg, bd
+
+        self.bg = rrect(cv, x, y, x + w, y + h, radius, fill=base,
+                        outline=bd or "", width=1 if bd else 0)
+        self.label = cv.create_text(x + w / 2, y + h / 2, text=text,
+                                    font=font, fill=fg)
+        self._tag = f"btn{id(self)}"
+        cv.itemconfig(self.bg, tags=(self._tag,))
+        cv.itemconfig(self.label, tags=(self._tag,))
+        cv.tag_bind(self._tag, "<Enter>", lambda e: self._to(1.0))
+        cv.tag_bind(self._tag, "<Leave>", lambda e: self._to(0.0))
+        cv.tag_bind(self._tag, "<ButtonPress-1>", self._down)
+        cv.tag_bind(self._tag, "<ButtonRelease-1>", self._up)
+        CanvasButton._registry.append(self)
+
+    @staticmethod
+    def _palette(kind):
+        return {
+            "primary": (SAGE, SAGE_DK, "#FFFFFF", ""),
+            "danger":  (ROSE, ROSE_DK, "#FFFFFF", ""),
+            "ok":      (OLIVE_BG, "#DCE7DA", "#4E6B4A", ""),
+            "ghost":   (CARD_ALT, "#EEEAE3", TEXT2, LINE),
+            "quiet":   (BG, "#EAE7E1", TEXT2, ""),
+        }.get(kind, (CARD_ALT, "#EEEAE3", TEXT, LINE))
+
+    # --- 状态 ---
+
+    def set_enabled(self, on: bool):
+        self.enabled = bool(on)
+        if not on:
+            self._hover = 0.0
+            self.cv.itemconfig(self.bg, fill=mix(CARD_ALT, BG, 0.5))
+            self.cv.itemconfig(self.label, fill=TEXT3)
+        else:
+            self.cv.itemconfig(self.bg, fill=self._c_base)
+            self.cv.itemconfig(self.label, fill=self._c_fg)
+
+    def set_text(self, t: str):
+        self.text = t
+        self.cv.itemconfig(self.label, text=t)
+
+    # --- 动画 ---
+
+    def _to(self, target: float):
+        if not self.enabled:
+            return
+        self._animate(self._hover, target, "_hover", 120)
+
+    def _animate(self, start, end, attr, ms):
+        if self._anim:
+            try:
+                self.cv.after_cancel(self._anim)
+            except Exception:
+                pass
+        steps = max(1, ms // 16)
+        state = {"i": 0}
+
+        def tick():
+            state["i"] += 1
+            t = state["i"] / steps
+            val = start + (end - start) * ease_out(t)
+            setattr(self, attr, val)
+            self._render()
+            if state["i"] < steps:
+                self._anim = self.cv.after(16, tick)
+            else:
+                self._anim = None
+        tick()
+
+    def _render(self):
+        if not self.enabled:
+            return
+        base = mix(self._c_base, self._c_hover, self._hover)
+        if self._press > 0:
+            base = mix(base, "#000000", 0.06 * self._press)
+        self.cv.itemconfig(self.bg, fill=base)
+        self.cv.coords(self.label,
+                       self.x + self.w / 2, self.y + self.h / 2 + self._press)
+
+    def _down(self, _e):
+        if not self.enabled:
+            return
+        self._press = 1
+        self._render()
+
+    def _up(self, _e):
+        if not self.enabled:
+            return
+        self._press = 0
+        self._render()
+        if self.command:
+            self.command()
+
+
+# ---------------------------------------------------------------- 状态点
+
+class StatusDot:
+    """带呼吸动画的状态圆点。"""
+
+    def __init__(self, cv, x, y, r=5, color=OLIVE):
+        self.cv = cv
+        self.x, self.y, self.r = x, y, r
+        self.color = color
+        self.id = cv.create_oval(x - r, y - r, x + r, y + r,
+                                 fill=color, outline="")
+        self._pulse = None
+        self._on = False
+
+    def set(self, color: str, pulse: bool = False):
+        self.color = color
+        self.cv.itemconfig(self.id, fill=color)
+        if pulse and not self._on:
+            self._start_pulse()
+        elif not pulse:
+            self._stop_pulse()
+
+    def move(self, x, y):
+        self.x, self.y = x, y
+        self.cv.coords(self.id, x - self.r, y - self.r, x + self.r, y + self.r)
+
+    def _start_pulse(self):
+        self._on = True
+        state = {"t": 0.0}
+
+        def tick():
+            if not self._on:
+                return
+            state["t"] = (state["t"] + 0.045) % (math.pi * 2)
+            s = 1 + 0.32 * (0.5 + 0.5 * math.sin(state["t"]))
+            r = self.r * s
+            self.cv.coords(self.id, self.x - r, self.y - r,
+                           self.x + r, self.y + r)
+            self._pulse = self.cv.after(40, tick)
+        tick()
+
+    def _stop_pulse(self):
+        self._on = False
+        if self._pulse:
+            try:
+                self.cv.after_cancel(self._pulse)
+            except Exception:
+                pass
+            self._pulse = None
+        self.cv.coords(self.id, self.x - self.r, self.y - self.r,
+                       self.x + self.r, self.y + self.r)
+
+
+# ---------------------------------------------------------------- 进度条
+
+class Shimmer:
+    """扫描时的细长流动进度条，不占布局空间，直接画在 Canvas 上。"""
+
+    def __init__(self, cv, y, x0, x1, color=SAGE):
+        self.cv, self.y, self.x0, self.x1 = cv, y, x0, x1
+        self.color = color
+        self.track = cv.create_line(x0, y, x1, y, fill=LINE_SOFT, width=3,
+                                    capstyle="round", state="hidden")
+        self.bar = cv.create_line(x0, y, x0 + 60, y, fill=color, width=3,
+                                  capstyle="round", state="hidden")
+        self._job = None
+        self._t = 0.0
+
+    def start(self):
+        self.cv.itemconfig(self.track, state="normal")
+        self.cv.itemconfig(self.bar, state="normal")
+        self._t = 0.0
+
+        def tick():
+            w = self.x1 - self.x0
+            span = max(80, w * 0.32)
+            self._t += 0.028
+            p = (math.sin(self._t) + 1) / 2
+            x = self.x0 + p * (w - span)
+            self.cv.coords(self.bar, x, self.y, x + span, self.y)
+            self._job = self.cv.after(24, tick)
+        tick()
+
+    def stop(self):
+        if self._job:
+            try:
+                self.cv.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self.cv.itemconfig(self.track, state="hidden")
+        self.cv.itemconfig(self.bar, state="hidden")

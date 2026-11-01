@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.buildenv/
+build/
+dist/
+.wifikill-state.json
+whitelist.txt
