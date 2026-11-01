@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/hero.png" alt="WiFiKill" width="100%">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/hero.png" alt="WiFiKill" width="100%">
 </p>
 
 <h1 align="center">WiFiKill</h1>
@@ -75,7 +75,7 @@ WiFiKill 是一个 Windows 桌面程序，能列出同一局域网里的所有�
 ## 界面
 
 <p align="center">
-  <img src="docs/images/ui.png" alt="界面说明" width="100%">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/ui.png" alt="界面说明" width="100%">
 </p>
 
 ---
@@ -83,7 +83,7 @@ WiFiKill 是一个 Windows 桌面程序，能列出同一局域网里的所有�
 ## 工作原理
 
 <p align="center">
-  <img src="docs/images/flow.png" alt="生命周期" width="100%">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/flow.png" alt="生命周期" width="100%">
 </p>
 
 ARP 是二层协议，负责把 IP 地址翻译成 MAC 地址，本身**没有任何认证机制**。
@@ -104,21 +104,24 @@ WiFiKill 做的是同时欺骗两端：
 ## 架构
 
 <p align="center">
-  <img src="docs/images/arch.png" alt="三层架构" width="100%">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/arch.png" alt="三层架构" width="100%">
 </p>
 
 | 文件 | 职责 |
 |---|---|
-| `gui.py` | 表现层。Tkinter 主窗口，所有耗时操作都在工作线程，结果经队列回主线程 |
+| `gui.py` | 表现层。Canvas 自绘主窗口，所有耗时操作走工作线程，结果经队列回主线程 |
+| `ui.py` | 视觉层。莫兰迪色板、圆角绘制、Canvas 按钮（hover/press 插值动画）、呼吸灯、流动进度条 |
+| `tray.py` | 系统托盘。纯 ctypes 调 `Shell_NotifyIcon`，独立线程跑消息循环，零第三方依赖 |
 | `core.py` | 逻辑层。设备发现、报文构造、阻断会话、状态持久化、单实例锁 |
 | `tests/` | 边界与故障路径测试（18 项断言） |
-| `selftest.py` | GUI 端到端自检（25 项断言，会驱动真实界面） |
-| `build.py` | 一键构建：版本号自增 → 文档版本同步 → 打包 → 出 zip |
+| `selftest.py` | GUI 端到端自检（28 项断言，会驱动真实界面） |
+| `installer/` | Inno Setup 脚本与简体中文语言文件，产出安装版 |
+| `build.py` | 一键构建：版本自增 → 文档版本同步 → 打包 → 出三个产物 |
 
 ## 安全设计
 
 <p align="center">
-  <img src="docs/images/safety.png" alt="安全护栏" width="100%">
+  <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/safety.png" alt="安全护栏" width="100%">
 </p>
 
 1. **网关保护** —— 目标列表里永远剔除网关；确实要断网关必须改代码，GUI 不提供开关。
@@ -152,7 +155,7 @@ WiFiKill 做的是同时欺骗两端：
 
 > Npcap 是发二层帧的驱动层，无法打包进 exe，必须单独装一次。
 
-### 方式二：源码运行
+### 从源码运行（开发者）
 
 ```bash
 git clone https://github.com/Asaceoo/WiFi-Kill.git
@@ -315,18 +318,25 @@ A：PyInstaller 单文件 + 网络扫描 + 提权是常见误报特征。源码�
 
 ```
 WiFi-Kill/
-├── core.py               逻辑层
-├── gui.py                界面层
+├── core.py               逻辑层：发现 / 投毒 / 状态 / 单实例锁
+├── gui.py                表现层：主窗口与交互编排
+├── ui.py                 视觉层：色板、圆角、按钮动画
+├── tray.py               系统托盘（纯 ctypes）
 ├── build.py              一键构建 + 版本自增
 ├── versions.json         版本真源
-├── selftest.py           GUI 端到端自检
-├── tests/test_edge.py    边界与故障路径测试
+├── selftest.py           GUI 端到端自检（28 项）
+├── tests/test_edge.py    边界与故障路径测试（18 项）
 ├── tools/make_images.py  概念图生成
+├── installer/
+│   ├── WiFiKill.iss      Inno Setup 脚本
+│   └── ChineseSimplified.isl
 ├── docs/
 │   ├── USER_MANUAL.md
 │   ├── TECH_MANUAL.md
 │   └── images/
-└── WiFiKill.spec         PyInstaller 配置
+├── .github/workflows/    推 tag 自动构建发布
+├── WiFiKill.spec         PyInstaller 配置
+└── LICENSE.txt
 ```
 
 ## 开发
@@ -338,7 +348,7 @@ python tests/test_edge.py
 # 跑 GUI 自检（会驱动真实窗口，注入一台"幽灵设备"，不影响任何人）
 python selftest.py
 
-# 构建 + 版本自增 + 出 zip
+# 构建 + 版本自增 + 出三个产物
 python build.py
 ```
 
