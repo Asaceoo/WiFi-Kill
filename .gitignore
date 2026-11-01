@@ -5,3 +5,6 @@ build/
 dist/
 .wifikill-state.json
 whitelist.txt
+
+# 自检脚本产出的截图
+t[0-9]*_*.png
