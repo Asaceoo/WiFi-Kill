@@ -130,12 +130,25 @@ WiFiKill 做的是同时欺骗两端：
 
 ## 安装
 
-### 方式一：直接下载（推荐）
+### 三种形态，按需选择一个
 
-1. 到 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) 下载 `WiFiKill-vX.Y.Z.zip`
-2. 解压到任意目录（**不要放在 C:\Program Files**，那里不可写）
+到 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) 下载：
+
+| 文件 | 形态 | 适合 |
+|---|---|---|
+| `WiFiKill-vX.Y.Z-setup.exe` | **安装版**（18.5 MB） | 想要开始菜单 / 桌面快捷方式、需要能正常卸载 |
+| `WiFiKill-vX.Y.Z.exe` | **单文件版**（16.9 MB） | 只想拷一个文件走，随插随用 |
+| `WiFiKill-vX.Y.Z-portable.zip` | **打包版**（16.6 MB） | 需要连同用户手册 / 技术手册一起归档、离线分发 |
+
+> 三者功能完全一致，区别只在分发方式。安装版会把程序装到 `%LocalAppData%\Programs\WiFiKill`，
+> 这个目录可写，白名单与阻断状态会落在那里。
+
+### 安装步骤（任一形态通用）
+
+1. 下载上表中任意一个文件
+2. 安装版双击安装即可；单文件版 / 打包版**解压到可写目录**（不要放 `C:\Program Files`）
 3. 安装 [Npcap](https://npcap.com/#download)，安装时**务必勾选 `WinPcap API-compatible Mode`**
-4. 双击 `WiFiKill.exe`
+4. 启动 `WiFiKill.exe`
 
 > Npcap 是发二层帧的驱动层，无法打包进 exe，必须单独装一次。
 
@@ -282,8 +295,8 @@ A：PyInstaller 单文件 + 网络扫描 + 提权是常见误报特征。源码�
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
 | 程序 | **v2.0.2** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.0.0 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.0.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| [用户手册](docs/USER_MANUAL.md) | v1.0.2 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.0.2 | 面向开发者，含报文结构、线程模型、测试与打包 |
 
 版本号由 `build.py` 自动递增，三份文档的版本会随每次构建同步更新。
 
@@ -292,7 +305,9 @@ A：PyInstaller 单文件 + 网络扫描 + 提权是常见误报特征。源码�
 1. `versions.json` 里 app / user_manual / tech_manual 各 +1 patch
 2. 把新版本写回两份手册与 README 的版本标记
 3. 生成 Windows 文件版本资源（exe 属性里可见）
-4. 打包 `dist/WiFiKill.exe` 与 `dist/WiFiKill-vX.Y.Z.zip`
+4. 打包出三个产物：`dist/WiFiKill-vX.Y.Z.exe`（单文件）、
+   `dist/WiFiKill-vX.Y.Z-setup.exe`（Inno Setup 安装包）、
+   `dist/WiFiKill-vX.Y.Z-portable.zip`（exe + 两份手册 + 许可）
 
 ---
 

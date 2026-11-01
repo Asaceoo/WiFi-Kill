@@ -373,7 +373,10 @@ python build.py
   ├─ 2. 正则替换两份手册的「文档版本」「对应程序」标记
   ├─ 3. 生成 build/version_info.txt（Windows 文件版本资源）
   ├─ 4. PyInstaller --onefile --windowed --version-file ... gui.py
-  └─ 5. 打包 dist/WiFiKill-vX.Y.Z.zip（exe + 三份文档 + LICENSE）
+  ├─ 5. PyInstaller 出 dist/WiFiKill.exe
+  ├─ 6. 复制为 dist/WiFiKill-vX.Y.Z.exe（单文件版）
+  ├─ 7. ISCC 编译 installer/WiFiKill.iss → dist/WiFiKill-vX.Y.Z-setup.exe（安装版）
+  └─ 8. 打 dist/WiFiKill-vX.Y.Z-portable.zip（exe + README + 两份手册 + LICENSE，打包版）
 ```
 
 文档里的标记行格式固定，构建脚本靠正则定位：

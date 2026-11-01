@@ -49,15 +49,18 @@
 
 安装完成后**重启程序**（若是从旧版本升级，建议重启系统）。
 
-### 第二步：解压程序
+### 第二步：取得程序（三种形态任选其一）
 
-把 `WiFiKill-vX.Y.Z.zip` 解压到任意**可写目录**，例如：
+到 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) 下载下表任一文件：
 
-```
-D:\Tools\WiFiKill\
-```
+| 文件 | 形态 | 说明 |
+|---|---|---|
+| `WiFiKill-vX.Y.Z-setup.exe` | 安装版 | 双击安装，自动建开始菜单与桌面快捷方式，装到 `%LocalAppData%\Programs\WiFiKill`（可写，状态文件正常落盘），可从「应用和功能」正常卸载 |
+| `WiFiKill-vX.Y.Z.exe` | 单文件版 | 不安装，拷到任意**可写目录**双击即可，例如 `D:\Tools\WiFiKill\` |
+| `WiFiKill-vX.Y.Z-portable.zip` | 打包版 | 解压后含 exe + 本手册 + 技术手册 + 许可协议，适合离线归档分发 |
 
-> 不要放在 `C:\Program Files\`，那个目录普通用户不可写，白名单和状态文件会存不下来。
+> 三者功能完全一致。若用单文件版或打包版，**不要放在 `C:\Program Files\`** ——
+> 那个目录普通用户不可写，白名单和状态文件会存不下来。安装版由安装程序选好了可写目录，无此问题。
 
 ### 第三步：双击运行
 
