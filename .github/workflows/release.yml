@@ -42,9 +42,21 @@ jobs:
       - name: 安装 Inno Setup
         run: choco install innosetup --no-progress -y
 
-      - name: 单元测试（边界 + IPv6 报文级，不发包）
+      - name: 验证解释器（含 scapy/tkinter）
+        shell: pwsh
         run: |
+          python -c "import sys, scapy, tkinter; print('python =', sys.executable); print('scapy =', scapy.__version__)"
+
+      - name: 单元测试-边界
+        shell: bash
+        run: |
+          set -e
           python tests/test_edge.py
+
+      - name: 单元测试-IPv6
+        shell: bash
+        run: |
+          set -e
           python tests/test_ipv6.py
 
       - name: 构建三种产物
