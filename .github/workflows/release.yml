@@ -12,6 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # CI runner 的 Python 默认 stdout 是 cp1252，打印中文会 UnicodeEncodeError。
+      # 强制 UTF-8 模式，确保测试与构建脚本的中文输出不崩溃。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
