@@ -7,7 +7,7 @@
 **局域网设备发现与 ARP 阻断工具**
 Windows GUI · 单文件免安装 · 不依赖手机 ROOT · 莫兰迪自绘界面
 
-<img src="https://img.shields.io/badge/version-v2.2.0-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.3.0-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4" alt="platform">
 <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="python">
 <img src="https://img.shields.io/badge/license-仅供学习研究-6B7280" alt="license">
@@ -70,7 +70,7 @@ WiFiKill 是一个 Windows 桌面程序，能列出同一局域网里的所有�
 | 🌐 IPv6 探测 | 扫描时读系统 IPv6 路由表，判定本网是否有全局 IPv6 |
 | ⚠️ 覆盖度告警 | 本网有 IPv6 时明确提示「当前阻断只对 IPv4 生效」，不假装断开了 |
 | 🔗 IPv6 定向阻断 | 实验功能：对单个目标做 NDP 投毒，切断经网关的出站流量 |
-| 🎨 自绘界面 | 莫兰迪配色、圆角卡片、7 类动效、多尺寸自绘图标，零第三方 UI 库 |
+| 🎨 自绘界面 | 莫兰迪配色、圆角卡片、10 类动效、多尺寸自绘图标，零第三方 UI 库 |
 
 ---
 
@@ -144,7 +144,7 @@ ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC�
 | `tray.py` | 系统托盘。纯 ctypes 调 `Shell_NotifyIcon`，独立线程跑消息循环，零第三方依赖 |
 | `ipv6.py` | IPv6 层。环境探测、链路本地地址探明、定向 NDP 投毒与失控保护 |
 | `core.py` | 逻辑层。设备发现、报文构造、阻断会话、状态持久化、单实例锁 |
-| `tests/` | 边界与故障路径测试（18 项）+ IPv6 报文级测试（34 项） |
+| `tests/` | 边界与故障路径测试（23 项）+ IPv6 报文级测试（34 项） |
 | `selftest.py` | GUI 端到端自检（28 项，会驱动真实界面） |
 | `installer/` | Inno Setup 脚本与简体中文语言文件，产出安装版 |
 | `build.py` | 一键构建：语义化版本自增 → 文档版本同步 → 打包 → 出三个产物 |
@@ -155,8 +155,9 @@ ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC�
   <img src="https://raw.githubusercontent.com/Asaceoo/WiFi-Kill/main/docs/images/safety.png" alt="安全护栏" width="100%">
 </p>
 
-1. **网关保护** —— 目标列表里永远剔除网关；确实要断网关必须改代码，GUI 不提供开关。
-2. **本机保护** —— 自己的 IP 不进候选。
+1. **网关保护** —— 目标列表里永远剔除网关（**单目标与全阻断两条路径都强制**）；
+   确实要断网关必须改代码，GUI 不提供开关。
+2. **本机保护** —— 自己的 IP 不进候选，单目标选择时同样强制跳过。
 3. **白名单** —— 阻断前逐条校验，IP 或 MAC 命中任一即跳过。
 4. **崩溃恢复** —— 每次增删目标都原子写 `.wifikill-state.json`；异常退出后重启会主动询问是否恢复。
 
@@ -328,9 +329,9 @@ A：PyInstaller 单文件 + 网络扫描是常见误报特征。源码在仓库�
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.2.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.2.0 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.2.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.3.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.3.0 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.3.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增（`--bump patch|minor|major`），文档版本随构建同步。

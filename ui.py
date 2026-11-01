@@ -275,8 +275,35 @@ class CanvasButton:
                    r0=6, r1=max(self.w, self.h) * 0.62, ms=420)
         except Exception:
             pass
+        if self.kind in ("primary", "danger", "ok"):
+            self._sheen()
         if self.command:
             self.command()
+
+    def _sheen(self):
+        """彩色按钮按下后，沿表面扫过一道高光带（流光），随后自行删除。"""
+        try:
+            x0, x1 = self.x, self.x + self.w
+            steps = 12
+            oid = self.cv.create_line(x0, self.y, x0, self.y + self.h,
+                                      fill="#FFFFFF", width=3, capstyle="round")
+            self.cv.tag_lower(oid, self.bg)
+
+            def tick(i=0):
+                try:
+                    if i > steps:
+                        self.cv.delete(oid)
+                        return
+                    x = x0 + (x1 - x0) * (i / steps)
+                    self.cv.coords(oid, x, self.y, x, self.y + self.h)
+                    self.cv.itemconfig(oid, fill=mix("#FFFFFF", self._c_base,
+                                                     i / steps * 0.85))
+                    self.cv.after(int(320 / steps), tick, i + 1)
+                except tk.TclError:
+                    pass
+            tick()
+        except tk.TclError:
+            pass
 
 
 # ---------------------------------------------------------------- 状态点

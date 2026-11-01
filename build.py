@@ -42,6 +42,8 @@ DOCVER_RE = re.compile(r"(文档版本：\*\*v)(\d+\.\d+\.\d+)(\*\*)")
 APPVER_RE = re.compile(r"(对应程序：\*\*v)(\d+\.\d+\.\d+)(\*\*)")
 README_VER_RE = re.compile(r"(\| 程序 \| \*\*v)(\d+\.\d+\.\d+)(\*\*)")
 README_BADGE_RE = re.compile(r"(badge/version-v)(\d+\.\d+\.\d+)")
+README_MANUAL_RE = re.compile(
+    r"(\| \[(用户手册|技术手册)\]\(docs/[A-Z_]+\.md\) \| v)(\d+\.\d+\.\d+)( \|)")
 
 
 def bump(v: str, level: str = "patch") -> str:
@@ -99,6 +101,10 @@ def sync_docs(v: dict):
         t = readme.read_text(encoding="utf-8")
         n = README_VER_RE.sub(lambda m: f"{m.group(1)}{v['app']}{m.group(3)}", t)
         n = README_BADGE_RE.sub(lambda m: f"{m.group(1)}{v['app']}", n)
+        # 手册版本行（v1.2.0 形式，非 **加粗**）也要同步
+        n = README_MANUAL_RE.sub(
+            lambda m: f"{m.group(1)}{v['user_manual' if m.group(2) == '用户手册' else 'tech_manual']}{m.group(4)}",
+            n)
         if n != t:
             readme.write_text(n, encoding="utf-8")
             changed.append("README.md")

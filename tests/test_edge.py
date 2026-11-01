@@ -193,11 +193,28 @@ def t_logger_isolation():
         check("日志回调抛错被隔离", False, "异常冒泡到了调用方")
 
 
+@case
+def t_protected_device():
+    """安全不变量：网关与本机在任意路径下都不可被阻断（对抗性审查第 3 轮发现）。"""
+    gw = core.Device(ip="10.0.0.1", mac="aa:bb:cc:dd:ee:02", note="网关")
+    me = core.Device(ip="10.0.0.2", mac="aa:bb:cc:dd:ee:01", note="本机")
+    phone = core.Device(ip="10.0.0.5", mac="aa:bb:cc:dd:ee:05", note="")
+    check("网关被标记受保护", core.is_protected(gw))
+    check("本机被标记受保护", core.is_protected(me))
+    check("普通设备不受保护", not core.is_protected(phone))
+    # 模拟单目标选择过滤：选中网关+手机，应只剩手机
+    picks = [d for d in (gw, me, phone) if not core.is_protected(d)]
+    check("单目标过滤后只剩普通设备", [d.ip for d in picks] == ["10.0.0.5"])
+    # 模拟只选网关：应无可阻断目标，直接拒绝
+    picks2 = [d for d in (gw,) if not core.is_protected(d)]
+    check("仅选网关 → 无可阻断目标", not picks2)
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
                t_whitelist_mac, t_restore_clears, t_stop_is_clean,
-               t_logger_isolation):
+               t_logger_isolation, t_protected_device):
         fn()
 
     print("\n=========== 边界测试 ===========")

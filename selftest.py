@@ -16,7 +16,12 @@ import sys
 import traceback
 from pathlib import Path
 
-from PIL import Image
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except ImportError:
+    Image = None
+    HAVE_PIL = False
 
 import core
 import gui
@@ -28,6 +33,8 @@ SHOTS = 0
 
 def snap(win, name):
     global SHOTS
+    if not HAVE_PIL:
+        return          # 无 Pillow 时跳过截图，不影响断言结果
     hwnd = int(win.wm_frame(), 16) if isinstance(win.wm_frame(), str) else win.winfo_id()
     u, g = ctypes.windll.user32, ctypes.windll.gdi32
     r = wt.RECT()

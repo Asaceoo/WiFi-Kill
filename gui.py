@@ -175,6 +175,7 @@ class App(tk.Tk):
         for lv, c in (("info", ui.TEXT2), ("ok", ui.OLIVE), ("warn", ui.SAND),
                       ("err", ui.ROSE_DK), ("debug", ui.TEXT3)):
             self.logtext.tag_configure(lv, foreground=c)
+        self.logtext.tag_configure("fresh", background=ui.SAGE_BG)
 
     def _make_menu(self):
         self.menu = tk.Menu(self, tearoff=0, font=self.F["body"], bg=ui.CARD,
@@ -219,6 +220,24 @@ class App(tk.Tk):
                        font=self.F["h1"], fill=ui.TEXT, tags="static")
         cv.create_text(P + 1, 66, text="局域网设备与阻断控制", anchor="w",
                        font=self.F["sub"], fill=ui.TEXT2, tags="static")
+        # 标题下的一道强调线：首次渲染从 0 生长到全宽（只播一次，重排不再重放）
+        acc_w = 118
+        acc = cv.create_line(P, 58, P + acc_w, 58, fill=ui.SAGE,
+                             width=3, capstyle="round", tags="static")
+        if not getattr(self, "_title_grown", False):
+            self._title_grown = True
+
+            def _grow(i: int = 0):
+                if self._destroyed:
+                    return
+                t = i / 10
+                try:
+                    cv.coords(acc, P, 58, P + acc_w * ui.ease_out(t), 58)
+                except tk.TclError:
+                    return
+                if i < 10:
+                    self._ui.after(22, _grow, i + 1)
+            _grow()
 
         self.btn_set.x = w - P - 68
         self.btn_env.x = self.btn_set.x - 8 - 92
@@ -492,12 +511,25 @@ class App(tk.Tk):
 
     def log(self, msg: str, level: str = "info"):
         self.logtext.configure(state="normal")
+        self.logtext.tag_remove("fresh", "1.0", "end")
         self.logtext.insert("end", f"{time.strftime('%H:%M:%S')}   {msg}\n", level)
+        # 最新一条短暂高亮，模拟「滚动到位」的提示
+        self.logtext.tag_add("fresh", "end-1c linestart", "end-1c lineend")
         self.logtext.see("end")
         lines = int(self.logtext.index("end-1c").split(".")[0])
         if lines > 400:
             self.logtext.delete("1.0", f"{lines - 400}.0")
         self.logtext.configure(state="disabled")
+        if not getattr(self, "_log_fade", False):
+            self._log_fade = True
+            self.after(620, self._clear_log_fresh)
+
+    def _clear_log_fresh(self):
+        self._log_fade = False
+        try:
+            self.logtext.tag_remove("fresh", "1.0", "end")
+        except tk.TclError:
+            pass
 
     def _drain(self):
         try:
@@ -844,7 +876,7 @@ class App(tk.Tk):
             return
         if all_devices:
             picks = [d for d in self._devices
-                     if d.note not in ("网关", "本机")
+                     if not core.is_protected(d)
                      and d.ip not in self._whitelist and d.mac not in self._whitelist]
             if not picks:
                 messagebox.showinfo("无可阻断设备", "除网关/本机/白名单外没有目标。")
@@ -857,7 +889,20 @@ class App(tk.Tk):
             if not ips:
                 return
             by_ip = {d.ip: d for d in self._devices}
-            picks = [by_ip[i] for i in ips if i in by_ip]
+            # 安全阀：单目标路径同样必须剔除网关与本机（core.is_protected）。
+            # 网关被断 = 全家断网；本机被断 = 自己失联。与「全阻断」的保护一致。
+            picks = [by_ip[i] for i in ips
+                     if i in by_ip and not core.is_protected(by_ip[i])]
+            skipped_protected = [i for i in ips
+                                 if i in by_ip and core.is_protected(by_ip[i])]
+            if skipped_protected:
+                self.log("已跳过受保护设备（网关/本机）：" + "、".join(skipped_protected), "warn")
+            if not picks:
+                messagebox.showwarning(
+                    "受保护设备",
+                    "网关与本机不能被阻断。\n"
+                    "阻断网关会切断整个网络，阻断本机会让自己失联。")
+                return
 
         code, msg = core.l2_check()
         if code != "ok":

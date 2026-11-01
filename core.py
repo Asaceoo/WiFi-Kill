@@ -26,7 +26,7 @@ from pathlib import Path
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -415,6 +415,15 @@ class Device:
     dtype: str = "—"
     note: str = ""
     state: str = "未阻断"
+
+
+def is_protected(d: Device) -> bool:
+    """设备是否受保护（网关 / 本机）。受保护设备在任何路径下都不可被阻断。
+
+    这是安全不变量：阻断网关会切断整个网络，阻断本机会让自己失联。
+    单目标选择与「全阻断」都必须遵守，因此抽成纯函数并纳入测试。
+    """
+    return d.note in ("网关", "本机")
 
 
 def scan(ni: NetInfo, timeout: float = 3.0, active: bool = True) -> tuple[list[Device], bool]:

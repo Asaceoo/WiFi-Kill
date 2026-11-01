@@ -48,13 +48,30 @@ jobs:
           tag_name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
           body: |
-            ## 本版重点
+            ## 本版重点（v2.3.0）
 
-            v2.1.0 起，程序会检测本网是否启用了全局 IPv6，并在顶部明确提示
-            「当前阻断只对 IPv4 生效」—— 不再出现「界面显示阻断中、目标照常上网」的静默失效。
-            可在设置里开启 IPv6 定向阻断（实验，默认关闭，同时只能断 1 台）。
+            **三视角对抗性审查收敛 · 安全阀补齐 · 更多动效 · 真机验证闭环**
+
+            ### 🛡️ 安全强化
+
+            - **修复关键安全缺陷**：单目标「阻断选中」此前不剔除网关与本机（只有「全阻断」做了过滤）。
+              误选网关会切断整个网络，误选本机会让自己失联。现在两条路径都强制
+              `core.is_protected()`，选到受保护设备会提示并跳过。
+            - 新增可测试安全不变量 `core.is_protected()`，边界测试 18 → 23 项。
+
+            ### ✨ 动效（7 → 10 类）
+
+            - **按钮流光**：彩色按钮按下后一道高光带扫过
+            - **标题强调线**："WiFiKill" 下灰绿线首次渲染从 0 生长到全宽
+            - **日志滚动高亮**：最新一条日志短暂浅绿底提示
+
+            ### 🔬 真机验证（本轮闭环）
+
+            - 对真实在线设备 `192.168.1.5` 阻断 → 嗅探捕获 **24 帧真实 ARP 毒化报文**（目标 12 + 网关 12）→ 恢复
+            - IPv6：组播 NA 被结构性保险**拒绝**（零上线）；真实单播 NA 确认**上线**；网关 IPv6 LLA 可达
+            - 全量回归：边界 23 + IPv6 报文 34 + GUI 端到端 28，全部通过
 
             ## 三种形态，按需选择
 
@@ -63,6 +80,8 @@ jobs:
             | **安装版** | `WiFiKill-${{ github.ref_name }}-setup.exe` | 中文安装向导，带开始菜单/桌面快捷方式与卸载 |
             | **单文件版** | `WiFiKill-${{ github.ref_name }}.exe` | 绿色单文件，拷走即用 |
             | **打包版** | `WiFiKill-${{ github.ref_name }}-portable.zip` | exe + 用户手册 + 技术手册 + 许可 |
+
+            另附：`README.md`、`docs/USER_MANUAL.md`、`docs/TECH_MANUAL.md` 为最新版本文档。
 
             ## 安装前必读
 
@@ -80,6 +99,9 @@ jobs:
             dist/WiFiKill-v*-setup.exe
             dist/WiFiKill-v*.exe
             dist/WiFiKill-v*-portable.zip
+            README.md
+            docs/USER_MANUAL.md
+            docs/TECH_MANUAL.md
 
       - name: 保留构建产物（便于排查）
         if: always()
