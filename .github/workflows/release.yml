@@ -16,10 +16,23 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v4
 
-      - name: 准备 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: 准备 Python（完整版，含 tkinter）
+        # 说明：actions/setup-python 在 Windows 上使用的是 actions/python-versions
+        # 预构建二进制，默认不含 tcl/tk，导致 build.py ensure_env() 的
+        # "import tkinter" 检查失败。此处改用 python.org 官方安装包（自带 tkinter）。
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "stop"
+          $py = "3.12.7"
+          $url = "https://www.python.org/ftp/python/$py/python-$py-amd64.exe"
+          $installer = Join-Path $env:TEMP "python-$py.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","Include_tcltk=1","Include_test=0","Include_launcher=0" -Wait
+          $pyDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312"
+          $pyDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $pythonExe = Join-Path $pyDir "python.exe"
+          & $pythonExe --version
+          & $pythonExe -c "import tkinter; print('tkinter OK:', tkinter.TkVersion)"
 
       - name: 安装依赖
         run: |
