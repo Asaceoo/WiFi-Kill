@@ -59,6 +59,32 @@ jobs:
           set -e
           python tests/test_ipv6.py
 
+      - name: 诊断-回传测试失败详情
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== 环境 ====="
+            python -c "import sys, scapy, tkinter; print('python', sys.executable, sys.version); print('scapy', scapy.__version__)"
+            echo "----- arp -a -----"
+            arp -a 2>&1 | head -30
+            echo "----- t_bad_cidr 直接复现 -----"
+            python -c "import core; ni=core.NetInfo(iface='test0',my_ip='10.0.0.2',my_mac='aa:bb:cc:dd:ee:01',gateway_ip='10.0.0.1',gateway_mac='aa:bb:cc:dd:ee:02',cidr='not-a-cidr',iface_name='Test IF'); print(core.scan(ni,0.3,active=False))"
+            echo "===== test_edge 全量输出 ====="
+            python tests/test_edge.py 2>&1
+            echo "edge_exit=$?"
+            echo "===== test_ipv6 全量输出 ====="
+            python tests/test_ipv6.py 2>&1
+            echo "ipv6_exit=$?"
+          } > ci-diag.txt
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add ci-diag.txt
+          git commit -m "ci: 诊断回传 run ${{ github.run_id }}" || true
+          git push origin HEAD:ci-diag --force || true
+          echo "诊断已回传 ci-diag"
+
       - name: 构建三种产物
         run: python build.py --no-bump
 
