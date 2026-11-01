@@ -62,6 +62,8 @@ jobs:
       - name: 诊断-回传测试失败详情
         if: failure()
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           {
@@ -78,12 +80,14 @@ jobs:
             python tests/test_ipv6.py 2>&1
             echo "ipv6_exit=$?"
           } > ci-diag.txt
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add ci-diag.txt
-          git commit -m "ci: 诊断回传 run ${{ github.run_id }}" || true
-          git push origin HEAD:ci-diag --force || true
-          echo "诊断已回传 ci-diag"
+          FNAME="ci-diag-${{ github.run_id }}.txt"
+          B64=$(base64 -w0 ci-diag.txt 2>/dev/null || base64 ci-diag.txt | tr -d '\n')
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Asaceoo/WiFi-Kill/contents/${FNAME}" \
+            -d "{\"message\":\"ci diag run ${{ github.run_id }}\",\"content\":\"${B64}\",\"branch\":\"ci-diag\"}")
+          echo "diagnostic commit http=$HTTP file=${FNAME}"
 
       - name: 构建三种产物
         run: python build.py --no-bump
