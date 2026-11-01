@@ -350,7 +350,7 @@ WiFi-Kill/
 ├── build.py              一键构建 + 语义化版本自增
 ├── versions.json         版本真源
 ├── selftest.py           GUI 端到端自检（28 项）
-├── tests/test_edge.py    边界与故障路径测试（18 项）
+├── tests/test_edge.py    边界与故障路径测试（23 项）
 ├── tests/test_ipv6.py    IPv6 报文级测试（34 项，CI 可跑）
 ├── tools/
 │   ├── make_images.py    概念图生成
