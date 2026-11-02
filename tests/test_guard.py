@@ -356,6 +356,53 @@ def test_guard_refresh_v6_after_rebaseline(monkeypatch):
         g._thread = None
 
 
+def test_guard_drift_clears_local_arp(monkeypatch):
+    """D1：漂移纠正时同步删除本机脏 ARP 条目（广播帧不会回环到本机栈）。"""
+    g, fake = _mk_guard(monkeypatch, drift="ff:ff:ff:ff:ff:ff")
+    calls = []
+    monkeypatch.setattr(core, "_run_hidden", lambda cmd, enc: calls.append(cmd) or "")
+    g._tick()                        # 第 1 拍：仅计数（去抖）
+    assert not any(c and c[0] == "arp" for c in calls), "去抖期不得删除本机条目"
+    g._tick()                        # 第 2 拍：判定投毒 → 广播纠正 + 本机自愈
+    assert ["arp", "-d", "192.168.1.1"] in calls, calls
+
+
+def test_guard_dry_run_skips_local_arp_clear(monkeypatch):
+    """D1：演练模式绝不动本机真实 ARP 缓存。"""
+    g, fake = _mk_guard(monkeypatch, drift="ff:ff:ff:ff:ff:ff")
+    g.dry_run = True
+    calls = []
+    monkeypatch.setattr(core, "_run_hidden", lambda cmd, enc: calls.append(cmd) or "")
+    g._tick()
+    g._tick()
+    assert calls == [], "演练模式不得改动本机 ARP 缓存"
+
+
+def test_guard_v6_drift_clears_local_neighbor(monkeypatch):
+    """D1：IPv6 漂移时删除本机邻居缓存条目（best-effort，netsh 需提权）。"""
+    import ipv6
+    monkeypatch.setattr(ipv6, "build_na", lambda **k: _FakePkt(_FakeLayer(kind="na")))
+    monkeypatch.setattr(ipv6, "ndp_table", lambda: {"fe80::1": "ff:ff:ff:ff:ff:ff"})  # 漂移
+    calls = []
+
+    def fake_run(cmd, enc):
+        calls.append(cmd)
+        if "show" in cmd and "interfaces" in cmd:
+            return ("   1   10  1500  connected  Loopback Pseudo-Interface 1\n"
+                    "   7    5  1500  connected  WLAN\n")
+        return ""
+
+    monkeypatch.setattr(core, "_run_hidden", fake_run)
+    monkeypatch.setattr(core, "friendly_iface", lambda g: "WLAN · Intel(R) Wi-Fi")
+    g, fake = _mk_guard(monkeypatch)
+    g.interval = 10.0                # every=1，每次都触发 v6 分支
+    g._v6 = ("fe80::1", g._gw_mac, g.ni.my_mac, "\\Device\\NPF_{FAKE}")
+    g._maybe_v6(g._v6)
+    deletes = [c for c in calls if c[:5] == ["netsh", "interface", "ipv6", "delete", "neighbors"]]
+    assert deletes, calls
+    assert any("address=fe80::1" in c and "interface=7" in c for c in deletes), deletes
+
+
 if __name__ == "__main__":
     import sys
 

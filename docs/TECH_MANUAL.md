@@ -192,6 +192,11 @@ Tk 动画最经典的死法是：窗口销毁后 `after` 回调继续触发，�
   要么基准已过时（路由器已更换），自动触发重估，避免无限拉锯。
 - **start() 防并发** —— stop() 后旧守护线程若尚未退出，start() 会先 join 等待；仍不退出
   则拒绝本次启动，避免两个守护线程并发 `_tick` 重复发包。
+- **本机缓存自愈（D1，真机审查发现）** —— 广播免费 ARP / 单播 NA **不会回环到本机
+  协议栈**（网卡不上交自发自收帧），因此重宣告只能纠正*其他设备*的缓存；
+  本机自身被投毒的条目靠「`arp -d` 删除 → 重新解析（真实网关应答）」自愈。
+  `arp -d` 无需管理员（真机实测）；IPv6 的 netsh 删除需提权，打包 exe（UAC 管理员）可用，
+  权限不足时 best-effort 跳过。演练模式绝不触碰本机缓存。
 - **dry_run 友好** —— 演练模式下只记录、绝对不发包。
 - **生命周期** —— 随主窗口启动/扫描自愈（断网重连后自动恢复运行），退出时随 `_quit` 停止。
 
@@ -553,7 +558,7 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 > 因此无法对其 LLA 做**端到端 IPv6 阻断**——这正是 §13 记录的已知限制，
 > 并非缺陷。IPv6 的报文构造、安全闸、单播上线与网关可达性均已真实验证。
 
-### 11.6 守护单元测试 `tests/test_guard.py`（18 项）
+### 11.6 守护单元测试 `tests/test_guard.py`（21 项）
 
 不碰真实网络，网络层全部用 fake 注入，断言「只发真实网关映射、不冒充、有去抖、dry_run 不发包」：
 
@@ -577,6 +582,9 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 | `cache_missing_debounce` | 缓存缺失与漂移共用去抖，连续 2 次才宣告；缺失不计投毒 |
 | `start_rejects_when_old_thread_alive` | stop 后旧线程未退出时 start 拒绝（防双线程并发） |
 | `refresh_v6_after_rebaseline` | 重估清空 _v6 后恢复一致上下文；env 与基准分歧时保持关闭 |
+| `drift_clears_local_arp` | 漂移纠正时同步 `arp -d` 删除本机脏条目（广播帧不回环本机栈） |
+| `dry_run_skips_local_arp_clear` | 演练模式绝不动本机真实缓存 |
+| `v6_drift_clears_local_neighbor` | IPv6 漂移时 best-effort 删除本机邻居条目（netsh 需提权） |
 
 ---
 

@@ -707,8 +707,14 @@ class App(tk.Tk):
         def work():
             ni = core.NetInfo(**self._net.__dict__)
             st = core.load_state()
-            ni.gateway_mac = st.get("gateway_mac") or ni.gateway_mac
-            ni.gateway_ip = st.get("gateway_ip") or ni.gateway_ip
+            # 对抗性审查 R1：状态里的网关信息可能来自旧网络 —— 换网后按旧网关
+            # 构造恢复帧只会发向失效 MAC，救不回目标还可能误报成功。
+            # 接口或网关 IP 不一致时放弃恢复并清除残留记录。
+            if (st.get("iface") and st["iface"] != ni.iface) or \
+                    (st.get("gateway_ip") and st["gateway_ip"] != ni.gateway_ip):
+                self._post(lambda: self.log("残留阻断记录来自其他网络，已忽略并清除", "warn"))
+                core.clear_state()
+                return
             k = core.Killer(ni, dry_run=False)
             for it in items:
                 k._targets[it["ip"]] = core.Target(it["ip"], it["mac"])

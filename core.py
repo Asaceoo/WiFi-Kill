@@ -1065,6 +1065,7 @@ class Guard:
                          f"检测到网关 MAC 漂移：缓存 {cur} ≠ 真实 {gw_mac}，"
                          f"疑似 ARP 投毒，已自动纠正")
                 self._reassert("MAC 漂移")
+                self._clear_local_arp()   # D1：广播纠正不了本机自身缓存，需删除重建
                 if fc >= 3:
                     # 纠正反复不生效：要么攻击者持续投毒，要么基准已过时
                     # （路由器已更换）。重估基准，避免把新真实网关"纠正"回旧 MAC。
@@ -1092,6 +1093,57 @@ class Guard:
                 LOG.emit("debug", "守护 IPv6 上下文与基准 MAC 不一致，暂不启用重宣告")
                 return
             self._v6 = (gw_lla, gw_mac.lower(), my_lla, self.ni.iface)
+
+    # --- 本机缓存自愈（真机审查 D1）---
+
+    def _clear_local_arp(self):
+        """删除本机 ARP 缓存里的网关条目，迫使系统重新询问真实网关。
+
+        真机审查发现的设计盲点：广播免费 ARP 不会回环到本机协议栈
+        （网卡不会把自发自收的帧上交），它只能纠正**其他设备**的缓存；
+        本机自己被投毒的条目必须靠「删除 → 重新解析（真实网关应答）」自愈。
+        `arp -d` 无需管理员权限（真机实测 rc=0）；攻击者若抢答，下一拍
+        监测会再次发现漂移并再次清除，形成持续对抗。
+        """
+        if self.dry_run:
+            LOG.emit("debug", "[演练] 跳过删除本机 ARP 条目")
+            return
+        try:
+            _run_hidden(["arp", "-d", self._gw_ip], "gbk")
+            LOG.emit("debug",
+                     f"已删除本机 ARP 缓存的网关条目（{self._gw_ip}），等待真实网关应答重建")
+        except Exception as e:
+            LOG.emit("debug", f"删除本机 ARP 条目失败：{e}")
+
+    def _clear_local_neighbor(self, gw_lla: str, iface: str):
+        """删除本机 IPv6 邻居缓存里的网关条目（best-effort）。
+
+        同 D1：单播 NA 同样不会回环到本机栈。netsh 需要管理员提权
+        （真机实测非提权返回「需要提升」）；打包 exe 以 UAC 管理员运行时
+        可用，权限不足时静默跳过 —— v6 防御本就 best-effort，由周期重宣告兜底。
+        """
+        if self.dry_run:
+            LOG.emit("debug", "[演练] 跳过删除本机 IPv6 邻居条目")
+            return
+        try:
+            name = (friendly_iface(iface) or "").split(" · ")[0].strip()
+            out = _run_hidden(
+                ["netsh", "interface", "ipv6", "show", "interfaces"], "gbk") or ""
+            idx = ""
+            for line in out.splitlines():
+                if name and name in line:
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        idx = parts[0]
+                        break
+            if not idx:
+                return
+            _run_hidden(
+                ["netsh", "interface", "ipv6", "delete", "neighbors",
+                 f"interface={idx}", f"address={gw_lla.split('%')[0]}"], "gbk")
+            LOG.emit("debug", f"已删除本机 IPv6 邻居缓存的网关条目（{gw_lla}）")
+        except Exception as e:
+            LOG.emit("debug", f"删除本机 IPv6 邻居条目失败：{e}")
 
     def _rebaseline(self):
         """重估守护基准（网络切换 / 纠正反复不生效时调用）。
@@ -1130,7 +1182,7 @@ class Guard:
         every = max(1, round(10.0 / self.interval))
         if self._v6_counter % every != 0:
             return
-        gw_lla, gw_mac, my_lla, _iface = v6
+        gw_lla, gw_mac, my_lla, iface = v6
         try:
             import ipv6 as _v6mod
             # best-effort 监控：本机 NDP 缓存里网关 LLA 的 MAC 是否被改
@@ -1145,6 +1197,7 @@ class Guard:
                 with self._lock:
                     self.anomaly_count += 1
                     self.last_anomaly_time = time.time()
+                self._clear_local_neighbor(gw_lla, iface)   # D1：单播 NA 到不了本机栈
             # 重宣告真实映射：L3 源是网关 LLA（属实），L2 源用本机 MAC（不冒充网关）
             na = _v6mod.build_na(
                 eth_src=self.ni.my_mac, eth_dst=self.ni.my_mac,
