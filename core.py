@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.7.2"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -1734,8 +1734,20 @@ def classify_target_frames(target_mac: str, my_mac: str, gw_mac: str, frames) ->
     return {"hits": hits, "leaks": leaks, "other": other}
 
 
-def verification_verdict(hits: int, leaks: int) -> tuple[str, str]:
-    """把计数翻译成一句用户能看懂的话（纯函数，便于单测）。"""
+def verification_verdict(hits: int, leaks: int, duty: int = 100) -> tuple[str, str]:
+    """把计数翻译成一句用户能看懂的话（纯函数，便于单测）。
+
+    对抗性审查第 10 轮：限速目标存在「恢复拍」——那几拍我们主动告诉目标真实网关 MAC，
+    它当然会直连真实网关。照旧判「部分生效」的话，每一台限速设备都会被误报成半失效。
+    因此 duty<100 时用单独判定，把间歇放行解释成预期行为。
+    """
+    if 0 < int(duty or 100) < 100:
+        if hits:
+            return ("throttled",
+                    f"限速中（{int(duty)}%）：已生效，直连真实网关的帧属于放行拍，属预期")
+        if leaks:
+            return ("unknown", f"限速中（{int(duty)}%）：窗口内只见到放行拍的帧，建议再验一次")
+        return ("unknown", f"限速中（{int(duty)}%）：窗口内没抓到该目标的帧，无法判定")
     if hits and not leaks:
         return "ok", "已生效：目标的出站帧正被打到本机（它上不了网）"
     if hits and leaks:
@@ -1774,7 +1786,8 @@ def verify_targets(ni: "NetInfo", targets, seconds: float = 4.0) -> dict[str, di
     out: dict[str, dict] = {}
     for t in targets:
         st = classify_target_frames(getattr(t, "mac", ""), ni.my_mac, ni.gateway_mac, frames)
-        code, text = verification_verdict(st["hits"], st["leaks"])
+        duty = int(getattr(t, "duty", 100) or 100)
+        code, text = verification_verdict(st["hits"], st["leaks"], duty)
         out[t.ip] = {"status": code, "text": text, **st}
     return out
 

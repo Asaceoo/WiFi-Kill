@@ -1188,7 +1188,8 @@ class App(tk.Tk):
                     lines.append(f"{t.ip}  {r['text']}")
                     self.log(f"[验证] {t.ip}：{r['text']}"
                              f"（吸到本机 {r['hits']} 帧 / 直连网关 {r['leaks']} 帧）",
-                             "ok" if r.get("status") == "ok" else "warn")
+                             {"ok": "ok", "throttled": "info"}.get(
+                                 r.get("status"), "warn"))
                 self._set_busy(False)
                 messagebox.showinfo("验证断网", "\n".join(lines), parent=self)
             self._post(done)
@@ -1653,6 +1654,8 @@ class App(tk.Tk):
         为什么要有它：部分网卡默认拒绝普通用户发二层帧；顶部横幅只会提示，
         没有入口的话用户只能自己去「右键 → 以管理员身份运行」再开一遍。
         """
+        if self._quitting or self._destroyed:
+            return          # 已在退出流程：别再释放一次锁、也别拉起第二个实例
         if core.is_admin():
             messagebox.showinfo("以管理员身份重启", "当前已经是管理员权限。", parent=self)
             return

@@ -495,6 +495,14 @@ def t_verification_verdict():
     check("分类只统计目标自己的帧", st == {"hits": 1, "leaks": 1, "other": 1}, st)
     check("空帧安全", core.classify_target_frames("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02",
                                                 "aa:bb:cc:dd:ee:03", [])["hits"] == 0)
+    # 第 10 轮：限速目标存在「恢复拍」，直连网关属预期，不能误报成半失效
+    th = core.verification_verdict(4, 3, 50)
+    th_leak = core.verification_verdict(0, 3, 50)
+    th_idle = core.verification_verdict(0, 0, 20)
+    check("限速目标命中即判 throttled", th[0] == "throttled", th)
+    check("限速目标只见到放行拍 → 建议重验", th_leak[0] == "unknown" and "再验" in th_leak[1], th_leak)
+    check("限速目标无帧 → 无法判定", th_idle[0] == "unknown" and "50%" not in th_idle[1], th_idle)
+    check("duty=100 仍走原判据", core.verification_verdict(4, 3, 100)[0] == "partial")
 
 
 @case

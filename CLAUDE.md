@@ -29,7 +29,7 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `tray.py` | 系统托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环，`notify()` 气泡通知 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、**多目标**定向 NDP 投毒（`NdpManager`/`NdpBlocker`，含 preflight 结构化护栏） |
 | `selftest.py` | GUI 端到端自检（51 项，含守护演练、哨兵链路、IPv6 可见性、换网中止） |
-| `tests/test_edge.py` | 边界与故障路径测试（71 项） |
+| `tests/test_edge.py` | 边界与故障路径测试（75 项） |
 | `tests/test_gui_smoke.py` | GUI 冒烟测试（26 项，CI 可跑、绝不发包） |
 | `tests/test_ipv6.py` | IPv6 报文级测试（58 项，CI 可跑） |
 | `tests/test_guard.py` | 本机守护单元测试（21 项，CI 可跑） |
@@ -53,7 +53,7 @@ python -m venv .buildenv
 python gui.py                    # 或 .buildenv\Scripts\python gui.py
 
 # 测试（纯脚本，非 pytest，失败退出码非 0）
-python tests/test_edge.py        # 边界 71 项，不碰真实设备
+python tests/test_edge.py        # 边界 75 项，不碰真实设备
 python tests/test_ipv6.py        # IPv6 报文级 58 项，不发包
 python tests/test_guard.py       # 本机守护 21 项，不发包
 python tests/test_sentinel.py    # 全网哨兵 11 项，不发包
@@ -117,8 +117,8 @@ python build.py --zip-only       # 只出打包版 zip
 | 文档 | 受众 | 内容 |
 |---|---|---|
 | `README.md` | 人类 | 快速开始 + 概念图 + 用法与使用说明 + 20 个使用实例 + 免责声明 |
-| `docs/USER_MANUAL.md` | 使用者 | 完整操作步骤 + 故障排查（文档 v1.6.1 / 程序 v2.6.1） |
-| `docs/TECH_MANUAL.md` | 开发者 | 报文结构 / 线程模型 / 测试 / 打包（文档 v1.6.1 / 程序 v2.6.1） |
+| `docs/USER_MANUAL.md` | 使用者 | 完整操作步骤 + 教程 A–P + 故障排查（版本见文档头部） |
+| `docs/TECH_MANUAL.md` | 开发者 | 报文结构 / 线程模型 / 验证判据 / 测试与发布（版本见文档头部） |
 | `CHANGELOG.md` | 所有人 | 每个版本改了什么 |
 
 <!-- neat-freak: initialized at 2026-11-02 -->
