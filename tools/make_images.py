@@ -243,11 +243,44 @@ def make_ui():
     im.save(OUT / "ui.png")
 
 
+def make_guard():
+    W, H = 1280, 372
+    im = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(im)
+
+    d.text((60, 36), "本机守护（主动防御）", font=font(34, bold=True), fill=TEXT)
+    d.text((60, 84), "不攻击任何人，只保证「网关 IP/LLA → 真实网关 MAC」不被篡改",
+           font=font(20), fill=MUTED)
+
+    steps = [("① 建立基准", "扫描缓存 + 实时询问双源一致才采纳，分歧即 fail closed", ACCENT_BG, ACCENT),
+             ("② 周期监测", "每 2 秒核对本机 ARP / NDP 缓存里的网关映射", WARN_BG, WARN),
+             ("③ 去抖判定", "连续 2 次漂移才判定投毒，瞬时抖动不误报", OK_BG, OK),
+             ("④ 双路纠正", "广播真实映射护他人；arp -d 删脏缓存护本机", DANGER_BG, DANGER)]
+    bw, gap = 282, 24
+    x = 60
+    for t1, t2, bg, fg in steps:
+        rbox(d, (x, 140, x + bw, 306), 14, CARD, BORDER, 2)
+        rbox(d, (x, 140, x + bw, 190), 14, bg)
+        center(d, (x, 140, x + bw, 190), t1, font(22, bold=True), fg)
+        yy = 210
+        for line in _wrap(t2, 13):
+            d.text((x + 20, yy), line, font=font(18), fill=MUTED)
+            yy += 30
+        if x + bw + gap < W - 80:
+            arrow(d, x + bw + 3, 224, x + bw + gap - 3, 224)
+        x += bw + gap
+
+    d.text((60, 326), "网络切换自动重估基准  ·  广播帧不回环本机协议栈，故本机自愈靠「删除 → 重新解析」",
+           font=font(18), fill=DANGER)
+    im.save(OUT / "guard.png")
+
+
 if __name__ == "__main__":
     make_hero()
     make_arch()
     make_flow()
     make_safety()
+    make_guard()
     make_ui()
     for p in sorted(OUT.glob("*.png")):
         print(f"  {p.name:12s} {p.stat().st_size // 1024} KB")
