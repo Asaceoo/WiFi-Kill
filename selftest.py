@@ -78,7 +78,8 @@ STATE_BACKUP: list[tuple[Path, bytes | None]] = []
 def isolate_state():
     """把外部状态文件挪开：上一轮中断残留的 whitelist.txt 会让断言结果
     取决于"上次跑到哪一步"，这是实测踩过的坑。"""
-    for f in (core.WHITELIST_FILE, core.STATE_FILE, core.GUARD_FILE):
+    for f in (core.WHITELIST_FILE, core.STATE_FILE, core.GUARD_FILE,
+              core.SENTINEL_FILE):
         try:
             STATE_BACKUP.append((f, f.read_bytes() if f.exists() else None))
             f.unlink(missing_ok=True)
@@ -256,6 +257,19 @@ def run():
             check("守护可关闭", not app._guard.is_active())
             check("守护按钮文字复原", app.btn_guard.text == "守护本机", app.btn_guard.text)
             check("守护开关持久化关闭", core.guard_enabled() is False)
+            # --- 全网哨兵（v2.5.0）---
+            check("哨兵已建基线(首次静默)", len(app._sentinel.pending()) == 0
+                  and len(app._sentinel._known) >= 1)
+            app._sentinel.feed_event("info", "自检：事件流写入验证")
+            check("哨兵事件流可写入", len(app._sentinel.events) >= 1
+                  and app._sentinel.events[-1]["kind"] == "info")
+            app._open_sentinel()               # 面板可打开
+            app.update()
+            check("哨兵面板可打开", any(isinstance(w, gui.tk.Toplevel)
+                                        for w in app.winfo_children()))
+            for w in list(app.winfo_children()):
+                if isinstance(w, gui.tk.Toplevel):
+                    w.destroy()
         except Exception:
             check("s6c", False, traceback.format_exc()[-300:])
 

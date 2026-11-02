@@ -74,6 +74,8 @@ class App(tk.Tk):
         self._ndp_mgr = _v6mod.NdpManager()   # 多目标 IPv6 阻断管理器
         self._guard = core.Guard(self._net, interval=2.0, dry_run=self._opts[1])
         self._guard_on = core.guard_enabled()   # 本机守护（主动防御）开关，持久化
+        self._sentinel = core.Sentinel(notify=self._sentinel_notify)  # 全网哨兵（v2.5.0）
+        self._guard.event_sink = self._sentinel.feed_event
         self._tray = None
         self._tray_hinted = False
         self._quitting = False
@@ -760,6 +762,10 @@ class App(tk.Tk):
         if self._guard_on and not self._guard.is_active():
             self._guard.dry_run = self._opts[1]
             self._guard.start()
+        try:
+            self._sentinel.feed_scan(devs)   # 全网哨兵：基线比对 + 新设备告警
+        except Exception as e:
+            self.log(f"哨兵处理异常：{e}", "debug")
         self._sync_guard_btn()
         self._render_net()
         self._render_rows(animate=True)
@@ -1097,6 +1103,16 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 本机守护
 
+    def _sentinel_notify(self, title: str, msg: str):
+        """Sentinel → 托盘气泡。走主线程队列（notify 修改共享 NOTIFYICONDATAW）。"""
+        def _fire():
+            try:
+                if self._tray:
+                    self._tray.notify(title[:63], msg[:255])
+            except Exception:
+                pass
+        self._post(_fire)
+
     def _sync_guard_btn(self):
         """按真实运行状态刷新「守护本机」按钮外观（ghost ↔ primary）。"""
         if not hasattr(self, "btn_guard"):
@@ -1130,6 +1146,68 @@ class App(tk.Tk):
             else:
                 self.log("本机守护启动失败：请先扫描到网关与真实网关 MAC", "warn")
         self._sync_guard_btn()
+
+    # ------------------------------------------------------------ 哨兵面板
+
+    def _open_sentinel(self):
+        """哨兵事件面板：待认领设备 + 事件历史（最近 200 条）。"""
+        win = tk.Toplevel(self)
+        win.title("哨兵 · 全网名册")
+        win.configure(bg=ui.BG)
+        win.transient(self)
+        body = tk.Frame(win, bg=ui.CARD, padx=18, pady=14)
+        body.pack(fill="both", expand=True)
+
+        pend = self._sentinel.pending()
+        tk.Label(body, text=f"待认领设备：{len(pend)} 台（新上线、尚未入册）",
+                 bg=ui.CARD, fg=ui.TEXT, font=self.F["small"]).pack(anchor="w")
+
+        def _refresh():
+            win.destroy()
+            self._open_sentinel()
+
+        for it in pend[:6]:
+            row = tk.Frame(body, bg=ui.CARD)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{it.get('ip') or '?'}    {it['mac']}",
+                     bg=ui.CARD, fg=ui.TEXT2, font=self.F["small"]).pack(side="left")
+
+            def _claim(m=it["mac"]):
+                self._sentinel.claim(m)
+                self.log(f"[哨兵] 已认领 {m} 入基线", "ok")
+                _refresh()
+
+            def _forget(m=it["mac"]):
+                self._sentinel.forget(m)
+                self.log(f"[哨兵] 已将 {m} 移出基线", "info")
+                _refresh()
+
+            tk.Button(row, text="认领", command=_claim, width=6, relief="flat",
+                      bg=ui.OLIVE_BG, fg=ui.OLIVE_DK, font=self.F["tiny"],
+                      cursor="hand2", activebackground=ui.OLIVE_BG).pack(side="right")
+            tk.Button(row, text="移出", command=_forget, width=6, relief="flat",
+                      bg=ui.ROSE_BG, fg=ui.ROSE_DK, font=self.F["tiny"],
+                      cursor="hand2", activebackground=ui.ROSE_BG).pack(
+                side="right", padx=6)
+
+        tk.Label(body, text=f"事件历史（最近 {len(self._sentinel.events)} 条）",
+                 bg=ui.CARD, fg=ui.TEXT, font=self.F["small"]).pack(
+            anchor="w", pady=(12, 4))
+        cols = ("t", "kind", "text")
+        tv = ttk.Treeview(body, columns=cols, show="headings", height=12)
+        for cid, w, h in (("t", 110, "时间"), ("kind", 70, "类型"), ("text", 380, "事件")):
+            tv.heading(cid, text=h)
+            tv.column(cid, width=w, anchor="w", stretch=(cid == "text"))
+        tv.pack(fill="both", expand=True)
+        for ev in reversed(self._sentinel.events):
+            tv.insert("", "end", values=(
+                time.strftime("%m-%d %H:%M:%S", time.localtime(ev.get("t", 0))),
+                {"new": "新设备", "claim": "认领", "forget": "移出",
+                 "poison": "投毒", "info": "信息"}.get(ev.get("kind", ""), ev.get("kind", "")),
+                ev.get("text", "")))
+        tk.Button(body, text="关闭", command=win.destroy, relief="flat",
+                  bg=ui.CARD_ALT, fg=ui.TEXT, font=self.F["small"],
+                  cursor="hand2", activebackground=ui.BG).pack(pady=(10, 0))
         self._draw_chips()
 
     def _on_double(self, _e):
@@ -1445,7 +1523,12 @@ class App(tk.Tk):
         tk.Label(body, text=f"白名单：{core.WHITELIST_FILE.name}\n"
                             f"状态：{core.STATE_FILE.name}（均在程序目录）",
                  bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"], justify="left").grid(
-            row=8, column=0, columnspan=3, sticky="w", pady=(16, 0))
+            row=8, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        tk.Button(body, text="哨兵事件…", command=self._open_sentinel,
+                  bg=ui.CARD_ALT, fg=ui.TEXT, font=self.F["tiny"],
+                  relief="flat", bd=0, cursor="hand2",
+                  activebackground=ui.BG, activeforeground=ui.TEXT).grid(
+            row=8, column=2, sticky="e", pady=(16, 0))
 
         tk.Label(body,
                  text="免责声明：本工具仅用于你拥有或已获授权的网络的学习研究。"

@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -888,6 +888,8 @@ class Guard:
         self._consecutive = 0
         self._failed_corr = 0   # 漂移纠正后仍未恢复的连续次数（用于判断基准过时）
         self._last_action = "待命"
+        self.event_sink = None  # callable(kind, text, mac, ip) — GUI 注入哨兵事件流
+        self._hunting = False   # 投毒者嗅探单飞标志（防线程堆积）
         # IPv6 上下文：(gw_lla, gw_mac, my_lla, iface)
         self._v6: tuple[str, str, str, str] | None = None
         self._v6_counter = 0
@@ -1066,6 +1068,7 @@ class Guard:
                          f"疑似 ARP 投毒，已自动纠正")
                 self._reassert("MAC 漂移")
                 self._clear_local_arp()   # D1：广播纠正不了本机自身缓存，需删除重建
+                self._hunt_poisoner(gw_ip, gw_mac, cur)   # 指认凶手
                 if fc >= 3:
                     # 纠正反复不生效：要么攻击者持续投毒，要么基准已过时
                     # （路由器已更换）。重估基准，避免把新真实网关"纠正"回旧 MAC。
@@ -1095,6 +1098,34 @@ class Guard:
             self._v6 = (gw_lla, gw_mac.lower(), my_lla, self.ni.iface)
 
     # --- 本机缓存自愈（真机审查 D1）---
+
+    def _hunt_poisoner(self, gw_ip: str, gw_mac: str, poison_mac: str):
+        """漂移确认后启动短嗅探，尝试指认投毒者的真实 MAC（单飞，不堆积线程）。"""
+        if self._hunting or self.dry_run:
+            return
+        self._hunting = True
+
+        def work():
+            try:
+                killer_mac = sniff_poisoner(self.ni, gw_ip, gw_mac, seconds=4.0)
+                if killer_mac and self.event_sink:
+                    self.event_sink(
+                        "poison", f"投毒者已定位：{killer_mac}"
+                                  f"（曾冒称网关 {gw_ip}），已在册跟踪",
+                        mac=killer_mac, ip=gw_ip,
+                        notify_key=f"poison:{killer_mac}",
+                        notify_title="ARP 投毒已拦截",
+                        notify_msg=f"攻击者 {killer_mac} 冒称网关，已自动纠正并记录")
+                elif self.event_sink:
+                    self.event_sink(
+                        "poison", "检测到网关映射漂移并已纠正，但未能定位投毒者"
+                                  "（攻击已停止或无法观测）",
+                        ip=gw_ip, notify_key="poison:unknown")
+            except Exception as e:
+                LOG.emit("debug", f"投毒者指认失败：{e}")
+            finally:
+                self._hunting = False
+        threading.Thread(target=work, daemon=True, name="wifikill-hunt").start()
 
     def _clear_local_arp(self):
         """删除本机 ARP 缓存里的网关条目，迫使系统重新询问真实网关。
@@ -1258,6 +1289,179 @@ class Guard:
             s.sendp(pkt, iface=self.ni.iface, verbose=0, count=1)
         except Exception as e:
             LOG.emit("debug", f"守护 IPv6 发送失败：{e}")
+
+
+# ------------------------------------------------------------------ 全网哨兵
+
+SENTINEL_FILE = APP_DIR / "sentinel.json"
+SENTINEL_MAX_EVENTS = 200
+NOTIFY_DEDUP_SECONDS = 300.0   # 同一事件 5 分钟内只弹一次通知
+
+
+class Sentinel:
+    """全网 ARP 哨兵：设备基线库 + 新设备告警 + 事件流。
+
+    与 Guard 的分工：Guard 管「网关映射防御」，Sentinel 管「全楼名册」。
+    - 基线半自动：首次运行把扫描到的全部设备静默入册（视为现任住户），
+      之后新出现的 MAC 产生「new」事件，人工 claim 认领 / forget 移出。
+    - notify 回调由 GUI 注入（托盘气泡）；未注入时只记 LOG，无头环境安全。
+    - 同一事件（按 key）5 分钟内只弹一次通知，防止持续攻击轰炸。
+    """
+
+    def __init__(self, notify=None):
+        self.notify = notify or (lambda title, msg: None)
+        self._lock = threading.Lock()
+        self._known: dict[str, dict] = {}   # mac.lower() -> {ip, name, known, first}
+        self.events: list[dict] = []
+        self._last_notify: dict[str, float] = {}
+        self.load()
+
+    # --- 持久化 ---
+
+    def load(self):
+        try:
+            if SENTINEL_FILE.exists():
+                data = json.loads(SENTINEL_FILE.read_text(encoding="utf-8"))
+                self._known = data.get("known") or {}
+                self.events = data.get("events") or []
+        except Exception as e:
+            LOG.emit("debug", f"哨兵基线读取失败（按空基线处理）：{e}")
+            self._known, self.events = {}, []
+
+    def save(self):
+        try:
+            with self._lock:
+                data = {"known": self._known, "events": self.events}
+            tmp = SENTINEL_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, SENTINEL_FILE)
+        except Exception as e:
+            LOG.emit("debug", f"哨兵基线写入失败：{e}")
+
+    # --- 扫描喂入 ---
+
+    def feed_scan(self, devices) -> list[dict]:
+        """喂入扫描结果。返回本次「新发现（未入册）」设备；首次运行静默建立基线。"""
+        new: list[dict] = []
+        first_run = False
+        with self._lock:
+            first_run = not self._known
+            for d in devices:
+                mac = (getattr(d, "mac", "") or "").lower()
+                if not _MAC_RE.match(mac):
+                    continue
+                rec = self._known.get(mac)
+                if rec is None:
+                    pending = not first_run
+                    self._known[mac] = {"ip": getattr(d, "ip", "") or "",
+                                        "name": getattr(d, "note", "") or "",
+                                        "known": not pending,
+                                        "first": time.time()}
+                    if pending:
+                        self._add_event("new", mac, d.ip, f"发现新设备 {d.ip}")
+                        new.append({"mac": mac, "ip": getattr(d, "ip", "")})
+                else:
+                    if getattr(d, "ip", ""):
+                        rec["ip"] = d.ip
+        for n in new:
+            self._notify_dedup(f"new:{n['mac']}", "发现新设备",
+                               f"{n['ip']} 首次接入网络，已记入哨兵待认领")
+        self.save()
+        return new
+
+    # --- 认领 / 移出 ---
+
+    def claim(self, mac: str) -> bool:
+        mac = (mac or "").lower()
+        with self._lock:
+            rec = self._known.get(mac)
+            if not rec:
+                return False
+            rec["known"] = True
+        self._add_event("claim", mac, rec.get("ip", ""), "设备已认领入基线")
+        self.save()
+        return True
+
+    def forget(self, mac: str) -> bool:
+        """移出基线：该设备下次出现会重新告警。"""
+        mac = (mac or "").lower()
+        with self._lock:
+            rec = self._known.pop(mac, None)
+        if not rec:
+            return False
+        self._add_event("forget", mac, rec.get("ip", ""), "设备已移出基线")
+        self.save()
+        return True
+
+    def pending(self) -> list[dict]:
+        """未认领（known=False）的设备列表。"""
+        with self._lock:
+            return [{"mac": m, **rec} for m, rec in self._known.items()
+                    if not rec.get("known")]
+
+    # --- 事件流（Guard / GUI 均可投喂）---
+
+    def feed_event(self, kind: str, text: str, mac: str = "", ip: str = "",
+                   notify_key: str = "", notify_title: str = "",
+                   notify_msg: str = ""):
+        """记录一条事件；可选弹通知（notify_key 相同的 5 分钟内只弹一次）。"""
+        with self._lock:
+            self._add_event(kind, mac, ip, text)
+        self.save()
+        if notify_key:
+            self._notify_dedup(notify_key, notify_title or kind, notify_msg or text)
+
+    # --- 内部 ---
+
+    def _add_event(self, kind: str, mac: str, ip: str, text: str) -> dict:
+        ev = {"t": time.time(), "kind": kind, "mac": mac, "ip": ip, "text": text}
+        self.events.append(ev)
+        if len(self.events) > SENTINEL_MAX_EVENTS:
+            self.events = self.events[-SENTINEL_MAX_EVENTS:]
+        LOG.emit("info", f"[哨兵] {text}")
+        return ev
+
+    def _notify_dedup(self, key: str, title: str, msg: str):
+        now = time.time()
+        with self._lock:
+            last = self._last_notify.get(key, 0.0)
+            if now - last < NOTIFY_DEDUP_SECONDS:
+                return
+            self._last_notify[key] = now
+        LOG.emit("warn", f"[哨兵] {title}：{msg}")
+        try:
+            self.notify(title, msg)
+        except Exception:
+            pass
+
+
+def sniff_poisoner(ni: "NetInfo", gw_ip: str, gw_mac: str,
+                   seconds: float = 4.0) -> str:
+    """短嗅探定位 ARP 投毒者。
+
+    抓取「声称自己是网关 IP、但硬件地址 ≠ 真实网关 MAC」的帧，返回其以太网
+    源 MAC（凶手脸）。抓不到（攻击已停 / 权限不足 / 客户端隔离）返回空串，
+    由调用方如实记录「未能定位」。
+    """
+    s = scapy_mod()
+    if s is None:
+        return ""
+    try:
+        from scapy.layers.l2 import ARP, Ether
+        target = (gw_mac or "").lower()
+        pkts = s.sniff(
+            iface=ni.iface, timeout=seconds, store=True,
+            lfilter=lambda p: (p.haslayer(ARP) and p.haslayer(Ether)
+                               and (p[ARP].psrc or "") == gw_ip
+                               and p[ARP].hwsrc
+                               and p[ARP].hwsrc.lower() != target
+                               and p[Ether].src.lower() != target))
+        for p in pkts:
+            return p[Ether].src.lower()
+    except Exception as e:
+        LOG.emit("debug", f"投毒者嗅探失败：{e}")
+    return ""
 
 
 # ------------------------------------------------------------------ 单实例锁
