@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.8.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -570,6 +570,7 @@ def arp_table() -> dict[str, str]:
 class Device:
     ip: str
     mac: str
+    host: str = ""          # 被动识别到的主机名（mDNS/LLMNR/NBNS/DHCP）
     vendor: str = "—"
     dtype: str = "—"
     note: str = ""
@@ -1818,7 +1819,227 @@ def verify_targets(ni: "NetInfo", targets, seconds: float = 4.0) -> dict[str, di
     return out
 
 
+
+# ---------------------------------------------------------------- 设备名识别
+
+HOSTNAME_BPF = "udp port 5353 or udp port 5355 or udp port 137 or udp port 68"
+
+
+def name_from_dns_packet(pkt) -> str:
+    """从 mDNS / LLMNR 的 DNS 报文里取一个主机名（纯函数，便于单测）。
+
+    mDNS 与 LLMNR 都是 DNS 报文格式，取第一个「看起来像主机名」的记录：
+    去掉 .local 后缀与 _service 这类服务名。
+    """
+    try:
+        from scapy.layers.dns import DNS
+        if not pkt.haslayer(DNS):
+            return ""
+        dns = pkt[DNS]
+    except Exception:
+        return ""
+    names: list[str] = []
+    for attr in ("qd", "an", "ns", "ar"):
+        section = getattr(dns, attr, None)
+        if not section:
+            continue
+        items = section if isinstance(section, list) else [section]
+        for rr in items:
+            raw = getattr(rr, "qname", None) or getattr(rr, "rrname", None)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "ignore")
+            name = str(raw or "").strip().rstrip(".")
+            if name:
+                names.append(name)
+    for name in names:
+        if name.endswith(".local"):
+            name = name[:-6]
+        if name and not name.startswith("_"):
+            return name
+    return ""
+
+
+def name_from_nbns_packet(pkt) -> str:
+    """从 NetBIOS 名称查询里取主机名（纯函数）。"""
+    try:
+        from scapy.layers.netbios import NBNSQueryRequest
+        if not pkt.haslayer(NBNSQueryRequest):
+            return ""
+        raw = pkt[NBNSQueryRequest].QName
+    except Exception:
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    return str(raw or "").replace("\x00", "").strip()
+
+
+def name_from_dhcp_packet(pkt) -> str:
+    """从 DHCP 报文的 hostname 选项取主机名（纯函数）。"""
+    try:
+        from scapy.layers.dhcp import DHCP
+        if not pkt.haslayer(DHCP):
+            return ""
+        for opt in pkt[DHCP].options:
+            if isinstance(opt, tuple) and opt and opt[0] == "hostname":
+                val = opt[1]
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", "ignore")
+                return str(val).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def hostname_from_packet(pkt) -> tuple[str, str]:
+    """返回 (源 MAC, 主机名)；识别不出返回 ("", "")。"""
+    try:
+        from scapy.layers.l2 import Ether
+        if not pkt.haslayer(Ether):
+            return "", ""
+        mac = (pkt[Ether].src or "").lower()
+    except Exception:
+        return "", ""
+    if not _MAC_RE.match(mac):
+        return "", ""
+    for parser in (name_from_dns_packet, name_from_nbns_packet, name_from_dhcp_packet):
+        name = parser(pkt)
+        if name:
+            return mac, name
+    return "", ""
+
+
+def _collect_hostname_packets(ni: "NetInfo", seconds: float = 3.0):
+    """只读嗅探：mDNS / LLMNR / NBNS / DHCP，用于被动识别主机名（不发包）。"""
+    s = scapy_mod()
+    if s is None:
+        return []
+    try:
+        return s.sniff(iface=ni.iface, timeout=max(0.5, float(seconds)),
+                       store=True, filter=HOSTNAME_BPF)
+    except Exception as e:
+        LOG.emit("debug", f"设备名嗅探失败：{e}")
+        return []
+
+
+def identify_hosts(ni: "NetInfo", devices, seconds: float = 3.0) -> dict[str, str]:
+    """被动识别设备名，返回 {mac: 主机名}。
+
+    只读嗅探局域网内的 mDNS / LLMNR / NBNS / DHCP 报文，**不发送任何报文**、
+    不访问外网（这也是它默认开启的原因）。想要更精确的名字仍需人工备注。
+    """
+    want = {(getattr(d, "mac", "") or "").lower() for d in devices}
+    want.discard("")
+    out: dict[str, str] = {}
+    for pkt in _collect_hostname_packets(ni, seconds):
+        mac, name = hostname_from_packet(pkt)
+        if not mac or not name:
+            continue
+        if want and mac not in want:
+            continue
+        out.setdefault(mac, name)
+    if out:
+        LOG.emit("info", f"已识别 {len(out)} 台设备的主机名")
+    return out
+
+
+def reverse_dns_names(ips, timeout: float = 0.6, limit: int = 64) -> dict[str, str]:
+    """对 IP 做 PTR 反查（可选补充手段），返回 {ip: 短名}。
+
+    注意：这会向本机配置的 DNS 解析器发查询；私有地址通常由本地解析器或路由器回答。
+    超时/失败一律跳过，不影响主流程。
+    """
+    out: dict[str, str] = {}
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(max(0.1, float(timeout)))
+    try:
+        for ip in list(ips)[:limit]:
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                continue
+            if name and name != ip:
+                out[ip] = str(name).split(".")[0]
+    finally:
+        socket.setdefaulttimeout(old)
+    return out
+
+
+# ---------------------------------------------------------------- 导出
+
+
+def export_devices_csv(devices, path, state_of=None) -> int:
+    """把设备清单写成 CSV（utf-8-sig，Excel 直接打开不乱码）。返回行数。"""
+    import csv as _csv
+    rows = 0
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["IP", "MAC", "主机名", "厂商", "类型", "标识", "状态", "备注"])
+        for d in devices:
+            state = state_of(d) if callable(state_of) else getattr(d, "state", "")
+            w.writerow([getattr(d, "ip", ""), getattr(d, "mac", ""),
+                        getattr(d, "host", ""), getattr(d, "vendor", ""),
+                        getattr(d, "dtype", ""), getattr(d, "note", ""),
+                        state, getattr(d, "alias", "")])
+            rows += 1
+    return rows
+
+
+def export_json(payload: dict, path) -> None:
+    """原子写 JSON（导出/审计用）。"""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def export_devices(devices, path, ni: "NetInfo" | None = None, state_of=None) -> int:
+    """按扩展名导出设备清单：.csv 或 .json。返回条目数。"""
+    p = Path(path)
+    if p.suffix.lower() == ".csv":
+        return export_devices_csv(devices, p, state_of)
+    export_json({
+        "exported": time.time(),
+        "kind": "devices",
+        "network": ({
+            "iface": getattr(ni, "iface", ""),
+            "my_ip": getattr(ni, "my_ip", ""),
+            "gateway_ip": getattr(ni, "gateway_ip", ""),
+            "cidr": getattr(ni, "cidr", ""),
+        } if ni is not None else {}),
+        "devices": [{
+            "ip": getattr(d, "ip", ""),
+            "mac": getattr(d, "mac", ""),
+            "host": getattr(d, "host", ""),
+            "vendor": getattr(d, "vendor", ""),
+            "dtype": getattr(d, "dtype", ""),
+            "note": getattr(d, "note", ""),
+            "state": (state_of(d) if callable(state_of) else getattr(d, "state", "")),
+        } for d in devices],
+    }, p)
+    return len(list(devices))
+
+
+def export_events(events, path) -> int:
+    """导出哨兵事件流（JSON 或 CSV）。返回条目数。"""
+    p = Path(path)
+    items = list(events)
+    if p.suffix.lower() == ".csv":
+        import csv as _csv
+        with open(p, "w", encoding="utf-8-sig", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["时间", "类型", "IP", "MAC", "事件"])
+            for e in items:
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S",
+                                         time.localtime(e.get("t", 0))),
+                            e.get("kind", ""), e.get("ip", ""), e.get("mac", ""),
+                            e.get("text", "")])
+        return len(items)
+    export_json({"exported": time.time(), "kind": "events", "events": items}, p)
+    return len(items)
+
+
 # ------------------------------------------------------------------ 单实例锁
+
 
 
 

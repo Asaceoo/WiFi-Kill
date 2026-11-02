@@ -12,6 +12,7 @@ gui.py — WiFiKill 图形界面（Canvas 自绘 · 莫兰迪风格）
 from __future__ import annotations
 
 import math
+import os
 import queue
 import sys
 import threading
@@ -19,7 +20,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import core
 import ui
@@ -36,7 +37,7 @@ def pick_family():
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, dry_run: bool = False):
         super().__init__()
         self.title(f"WiFiKill {core.APP_VERSION}")
         self.geometry("1320x980")
@@ -67,7 +68,13 @@ class App(tk.Tk):
         self._closing = False
         self._destroyed = False
         self._main_thread = threading.current_thread()  # log/set_status 必须回主线程
-        self._opts = (1.5, False)
+        self._teaching = bool(dry_run)      # 教学/演练：绝不发真实报文
+        self._opts = (1.5, True) if self._teaching else (1.5, False)
+        self._identify = True               # 设备名识别（本地嗅探，不发包）
+        self._identifying = False
+        self._filter = ""
+        self._sort_key = None
+        self._sort_rev = False
         self._ndp_on = False              # IPv6 阻断开关，默认关（两道门之一）
         self._v6env = None                # ipv6.V6Env，扫描后探测
         import ipv6 as _v6mod
@@ -150,7 +157,8 @@ class App(tk.Tk):
         widths = {"no": 50, "ip": 142, "mac": 168, "vendor": 172,
                   "dtype": 94, "mark": 120, "state": 106, "_sp": 36}
         for c in heads:
-            self.tree.heading(c, text=heads[c], anchor="w")
+            self.tree.heading(c, text=heads[c], anchor="w",
+                              command=(lambda col=c: self._sort_by(col)))
             self.tree.column(c, width=widths[c], minwidth=widths[c] - 24,
                              anchor="w", stretch=(c == "_sp"))
         self.tree.tag_configure("blocked", foreground=ui.ROSE_DK)
@@ -160,6 +168,11 @@ class App(tk.Tk):
         self.tree.tag_configure("flash", background=ui.SAGE_BG)
         self.tree.tag_configure("v4only", foreground=getattr(ui, "SAND_DK", ui.SAND))
 
+        self._search_var = tk.StringVar()
+        self._search = tk.Entry(self.canvas, textvariable=self._search_var,
+                                font=self.F["small"], bg=ui.CARD_ALT, fg=ui.TEXT,
+                                relief="flat", insertbackground=ui.TEXT)
+        self._search_var.trace_add("write", self._on_filter_change)
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Button-3>", self._on_right)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_buttons())
@@ -338,6 +351,10 @@ class App(tk.Tk):
         cv.tag_bind("wlt", "<Button-1>", lambda e: self._toggle_wl())
         cv.tag_bind("wlt", "<Enter>", lambda e: cv.configure(cursor="hand2"))
         cv.tag_bind("wlt", "<Leave>", lambda e: cv.configure(cursor=""))
+        # 搜索框：过滤 IP / MAC / 主机名 / 厂商 / 标识 / 备注
+        self._search.place(x=tx0 - 12 - 220, y=ty + 8, width=220, height=26)
+        self._search.delete(0, "end")
+        self._search.insert(0, self._filter)
 
         self._shimmer.y, self._shimmer.x0, self._shimmer.x1 = ty + 52, P, w - P
         if self._busy:
@@ -668,6 +685,13 @@ class App(tk.Tk):
         if code is None:
             code, msg = core.l2_check()
         admin = core.is_admin()
+        if self._teaching:
+            self._banner_state = ("warn",
+                                  "教学/演练模式：不会发送任何真实报文（阻断只记录，不生效）")
+            self._badge_dot.set(ui.SAND)
+            self._status_text = "演练模式"
+            self._relayout(self._geo["w"], self._geo["h"])
+            return
         if code == "no_npcap":
             self._banner_state = ("npcap", "未安装 Npcap —— 只能扫描，无法阻断")
             self._badge_dot.set(ui.SAND)
@@ -835,9 +859,40 @@ class App(tk.Tk):
         self._render_rows(animate=True)
         self._animate_footer()
         self._render_banner()      # IPv6 状态会影响横幅，扫描完必须重画
+        self._identify_hosts_async(ni, devs)
         if not active:
             self.log("二层不可用，改为读取系统 ARP 缓存（可能不完整）", "warn")
         self.log(f"{'主动扫描' if active else '缓存读取'}完成，发现 {len(devs)} 台设备", "ok")
+
+    def _identify_hosts_async(self, ni: core.NetInfo, devs: list):
+        """被动识别设备名（mDNS / LLMNR / NBNS / DHCP），只读不发包。"""
+        if not self._identify or not devs or self._identifying:
+            return
+        self._identifying = True
+
+        def work():
+            names = {}
+            try:
+                names = core.identify_hosts(ni, devs, seconds=3.0)
+            except Exception as e:
+                self._post(lambda: self.log(f"设备名识别失败：{e}", "debug"))
+
+            def done():
+                self._identifying = False
+                if not names:
+                    return
+                by_mac = {m.lower(): n for m, n in names.items()}
+                hit = 0
+                for d in self._devices:
+                    nm = by_mac.get((d.mac or "").lower())
+                    if nm and not (getattr(d, "host", "") or ""):
+                        d.host = nm
+                        hit += 1
+                if hit:
+                    self.log(f"已识别 {hit} 台设备的主机名（本地嗅探，未发任何包）", "info")
+                    self._render_rows()
+            self._post(done)
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_v6env(self, ni: core.NetInfo):
         """探测本网段的 IPv6 状况。只读系统路由表，不发包。"""
@@ -861,6 +916,9 @@ class App(tk.Tk):
         alias = self._aliases.get(d.mac) or self._aliases.get(d.ip)
         if alias:
             return alias
+        host = (getattr(d, "host", "") or "").strip()
+        if host:
+            return host
         if d.note == "网关":
             return "网关"
         if d.note == "本机":
@@ -926,7 +984,7 @@ class App(tk.Tk):
 
         rows = []
         idx = 0
-        for d in self._devices:
+        for d in self._visible_devices():
             state, tag = self._state_of(d)
             if self._wl_hidden and state == "白名单":
                 continue
@@ -1295,6 +1353,89 @@ class App(tk.Tk):
             self._post(self._render_rows)
         threading.Thread(target=work, daemon=True).start()
 
+    def _sort_by(self, col: str):
+        """点表头排序；同一列再点一次反向。"""
+        if col in ("_sp", "no"):
+            return
+        if self._sort_key == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_key, self._sort_rev = col, False
+        self._render_rows()
+
+    def _visible_devices(self) -> list:
+        """按搜索词过滤 + 按当前排序列排序后的设备列表。"""
+        items = list(self._devices)
+        kw = (self._filter or "").strip().lower()
+        if kw:
+            def hit(d) -> bool:
+                alias = self._aliases.get(d.mac) or self._aliases.get(d.ip) or ""
+                blob = " ".join([d.ip, d.mac, getattr(d, "host", "") or "",
+                                 d.vendor or "", d.dtype or "", d.note or "", alias])
+                return kw in blob.lower()
+            items = [d for d in items if hit(d)]
+        if self._sort_key:
+            col = self._sort_key
+
+            def key(d):
+                if col == "ip":
+                    try:
+                        return (0, tuple(int(x) for x in d.ip.split(".")))
+                    except Exception:
+                        return (1, d.ip)
+                if col == "mac":
+                    return (0, d.mac)
+                if col == "state":
+                    return (0, self._state_of(d)[0])
+                if col == "mark":
+                    return (0, self._mark_of(d))
+                return (0, str(getattr(d, col, "")))
+            try:
+                items.sort(key=key, reverse=self._sort_rev)
+            except Exception:
+                pass
+        return items
+
+    def _on_filter_change(self, *_a):
+        self._filter = self._search_var.get()
+        self._render_rows()
+
+    def _export_devices(self):
+        """导出当前设备清单（CSV / JSON）。"""
+        if not self._devices:
+            messagebox.showinfo("导出", "还没有设备数据，先扫描一次。", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="导出设备清单", defaultextension=".csv",
+            initialfile=f"wifikill-devices-{time.strftime('%Y%m%d-%H%M')}.csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            n = core.export_devices(self._devices, path,
+                                    ni=self._net, state_of=lambda d: self._state_of(d)[0])
+            self.log(f"已导出 {n} 台设备清单：{os.path.basename(path)}", "ok")
+        except Exception as e:
+            self.log(f"导出失败：{e}", "err")
+            messagebox.showwarning("导出失败", str(e), parent=self)
+
+    def _export_events(self):
+        """导出哨兵事件流（CSV / JSON）。"""
+        if not self._sentinel.events:
+            messagebox.showinfo("导出", "还没有事件记录。", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="导出事件流", defaultextension=".csv",
+            initialfile=f"wifikill-events-{time.strftime('%Y%m%d-%H%M')}.csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            n = core.export_events(self._sentinel.events, path)
+            self.log(f"已导出 {n} 条事件：{os.path.basename(path)}", "ok")
+        except Exception as e:
+            self.log(f"导出失败：{e}", "err")
+
     def _select_all(self):
         """选中当前可见的全部设备行（不跨隐藏的白名单行）。"""
         try:
@@ -1490,6 +1631,8 @@ class App(tk.Tk):
         self.menu.add_separator()
         self.menu.add_command(label="复制 IP", command=lambda: self._copy("ip"))
         self.menu.add_command(label="复制 MAC", command=lambda: self._copy("mac"))
+        self.menu.add_separator()
+        self.menu.add_command(label="导出设备清单…", command=self._export_devices)
         sel = self.tree.selection()
         has_alias = any((self._aliases.get(i)) for i in sel)
         self.menu.add_command(label="设置备注…", command=self._set_alias)
@@ -1829,12 +1972,23 @@ class App(tk.Tk):
                   activebackground=ui.BG, activeforeground=ui.TEXT).grid(
             row=8, column=2, sticky="e", pady=(16, 0))
 
+        identify = tk.BooleanVar(value=bool(self._identify))
+        tk.Checkbutton(body, text="识别设备名（本地嗅探 mDNS/LLMNR/NBNS/DHCP，不发包）",
+                       variable=identify, bg=ui.CARD, fg=ui.TEXT, font=self.F["small"],
+                       selectcolor=ui.BG, activebackground=ui.CARD,
+                       highlightthickness=0, bd=0).grid(
+            row=9, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        tk.Label(body, text="只读取局域网广播报文推断主机名，不发送任何报文、不联网上传。",
+                 bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"],
+                 justify="left", wraplength=430).grid(
+            row=10, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         tk.Label(body,
                  text="免责声明：本工具仅用于你拥有或已获授权的网络的学习研究。"
                       "阻断他人设备可能违反法律法规与网络使用条款。",
                  bg=ui.CARD, fg=ui.SAND_DK, font=self.F["tiny"],
                  justify="left", wraplength=430).grid(
-            row=9, column=0, columnspan=3, sticky="w", pady=(14, 0))
+            row=11, column=0, columnspan=3, sticky="w", pady=(14, 0))
 
         def save():
             try:
@@ -1847,6 +2001,7 @@ class App(tk.Tk):
                 self._killer.interval = val
                 self._killer.dry_run = dry.get()
             self._guard.dry_run = dry.get()   # 演练模式同样作用于守护
+            self._identify = bool(identify.get())
 
             if ndp.get() != self._ndp_on:
                 self._ndp_on = ndp.get()
@@ -1888,6 +2043,12 @@ class App(tk.Tk):
 
         btns = tk.Frame(body, bg=ui.CARD)
         btns.grid(row=10, column=0, columnspan=3, sticky="e", pady=(20, 0))
+        for txt, cmd in (("导出设备清单…", self._export_devices),
+                         ("导出事件流…", self._export_events)):
+            tk.Button(btns, text=txt, command=cmd, relief="flat", bd=0,
+                      bg=ui.CARD_ALT, fg=ui.TEXT, font=self.F["small"],
+                      padx=12, pady=6, cursor="hand2",
+                      activebackground=ui.BG).pack(side="left", padx=(0, 8))
         if not core.is_admin():
             tk.Button(btns, text="以管理员身份重启", command=self._restart_as_admin,
                       relief="flat", bd=0, bg=ui.SAND_BG, fg=ui.SAND_DK,
@@ -1904,8 +2065,9 @@ class App(tk.Tk):
 
 def main():
     minimized = "--minimized" in sys.argv
+    teaching = "--dry-run" in sys.argv
     try:
-        app = App()
+        app = App(dry_run=teaching)
         if minimized:
             app.withdraw()
         app.mainloop()

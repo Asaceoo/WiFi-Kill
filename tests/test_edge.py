@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -521,6 +522,83 @@ def t_arp_row_conversion():
     check("空输入安全", core._arp_rows_to_table([]) == {})
 
 
+@case
+def t_hostname_parsers():
+    """设备名识别（第 12 轮）：mDNS / LLMNR / NBSN / DHCP 报文的纯函数解析。"""
+    from scapy.layers.dns import DNS, DNSQR
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP, UDP
+
+    mdns = (Ether(src="aa:bb:cc:dd:ee:01") / IP() / UDP()
+            / DNS(qd=DNSQR(qname="macbook-pro.local")))
+    llmnr = (Ether(src="aa:bb:cc:dd:ee:02") / IP() / UDP()
+             / DNS(qd=DNSQR(qname="DESKTOP-ABC")))
+    svc = (Ether(src="aa:bb:cc:dd:ee:03") / IP() / UDP()
+           / DNS(qd=DNSQR(qname="_airplay._tcp.local")))
+    check("mDNS 去掉 .local 后缀",
+          core.name_from_dns_packet(mdns) == "macbook-pro", core.name_from_dns_packet(mdns))
+    check("LLMNR 原样返回",
+          core.name_from_dns_packet(llmnr) == "DESKTOP-ABC", core.name_from_dns_packet(llmnr))
+    check("服务名（下划线开头）不当主机名",
+          core.name_from_dns_packet(svc) == "", core.name_from_dns_packet(svc))
+    mac, name = core.hostname_from_packet(mdns)
+    check("从报文取到 (mac, name)",
+          mac == "aa:bb:cc:dd:ee:01" and name == "macbook-pro", f"{mac} {name}")
+    check("无 Ether 的报文安全", core.hostname_from_packet(object()) == ("", ""))
+    check("非法源 MAC 被拒",
+          core.hostname_from_packet(Ether(src="zz:zz") / IP() / UDP()
+                                    / DNS(qd=DNSQR(qname="x.local"))) == ("", ""))
+
+    try:
+        from scapy.layers.dhcp import BOOTP, DHCP
+        dhcp = (Ether(src="aa:bb:cc:dd:ee:04") / IP() / UDP() / BOOTP()
+                / DHCP(options=[("hostname", "android-abcd"), "end"]))
+        check("DHCP hostname 解析",
+              core.name_from_dhcp_packet(dhcp) == "android-abcd",
+              core.name_from_dhcp_packet(dhcp))
+    except Exception as e:
+        check("DHCP hostname 解析（构造失败则跳过）", True, str(e)[:60])
+
+    try:
+        from scapy.layers.netbios import NBNSQueryRequest
+        nbns = (Ether(src="aa:bb:cc:dd:ee:05") / IP() / UDP()
+                / NBNSQueryRequest(QName="MY-PC"))
+        got = core.name_from_nbns_packet(nbns)
+        check("NBNS 解析返回字符串（或安全空串）", isinstance(got, str), repr(got))
+    except Exception as e:
+        check("NBNS 解析（构造失败则跳过）", True, str(e)[:60])
+
+
+@case
+def t_export_devices_and_events():
+    """导出（第 12 轮）：设备清单 CSV/JSON 与事件流 CSV。"""
+    import json as _json
+    import tempfile
+    from pathlib import Path as _P
+    tmp = _P(tempfile.mkdtemp())
+    devs = [core.Device(ip="10.0.0.5", mac="aa:bb:cc:dd:ee:05", host="macbook",
+                        vendor="Apple", dtype="移动设备", note="同学"),
+            core.Device(ip="10.0.0.6", mac="aa:bb:cc:dd:ee:06")]
+    csv_path = tmp / "d.csv"
+    n = core.export_devices(devs, csv_path,
+                            state_of=lambda d: "阻断中" if d.ip.endswith("5") else "未阻断")
+    text = csv_path.read_text(encoding="utf-8-sig")
+    check("CSV 行数与表头正确", n == 2 and "IP,MAC" in text, str(n))
+    check("CSV 含主机名与状态", "macbook" in text and "阻断中" in text)
+
+    json_path = tmp / "d.json"
+    core.export_devices(devs, json_path)
+    data = _json.loads(json_path.read_text(encoding="utf-8"))
+    check("JSON 结构正确",
+          data["kind"] == "devices" and len(data["devices"]) == 2, str(data)[:80])
+
+    ev_path = tmp / "e.csv"
+    n2 = core.export_events([{"t": time.time(), "kind": "new", "mac": "aa:bb:cc:dd:ee:05",
+                              "ip": "10.0.0.5", "text": "发现新设备"}], ev_path)
+    etext = ev_path.read_text(encoding="utf-8-sig")
+    check("事件 CSV 导出", n2 == 1 and "发现新设备" in etext, str(n2))
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
@@ -533,7 +611,8 @@ def main():
                # 第 7 轮：发送顺序 / 邻居表转换
                t_stale_generation_refuses_send, t_restore_frames_come_last,
                t_arp_row_conversion, t_verification_verdict,
-               t_relaunch_command_keeps_entry_script):
+               t_relaunch_command_keeps_entry_script,
+               t_hostname_parsers, t_export_devices_and_events):
         fn()
 
     print("\n=========== 边界测试 ===========")

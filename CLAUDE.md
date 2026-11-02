@@ -29,8 +29,8 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `tray.py` | 系统托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环，`notify()` 气泡通知 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、**多目标**定向 NDP 投毒（`NdpManager`/`NdpBlocker`，含 preflight 结构化护栏） |
 | `selftest.py` | GUI 端到端自检（51 项，含守护演练、哨兵链路、IPv6 可见性、换网中止） |
-| `tests/test_edge.py` | 边界与故障路径测试（75 项） |
-| `tests/test_gui_smoke.py` | GUI 冒烟测试（26 项，CI 可跑、绝不发包） |
+| `tests/test_edge.py` | 边界与故障路径测试（87 项） |
+| `tests/test_gui_smoke.py` | GUI 冒烟测试（35 项，CI 可跑、绝不发包） |
 | `tests/test_ipv6.py` | IPv6 报文级测试（65 项，CI 可跑） |
 | `tests/test_guard.py` | 本机守护单元测试（21 项，CI 可跑） |
 | `tests/test_sentinel.py` | 全网哨兵单元测试（12 项，CI 可跑） |
@@ -39,7 +39,7 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `versions.json` | 版本真源（app / user_manual / tech_manual / build / released） |
 | `installer/` | Inno Setup 脚本 + 中文语言文件 + `DISCLAIMER.txt`（向导首屏 LicenseFile） |
 | `docs/` | 两份手册 + `images/` 概念图（README/手册相对引用，随 zip 与安装包分发） |
-| `tools/` | 图标与概念图生成（`make_images.py` 含 `make_guard`） |
+| `tools/` | 图标/概念图生成 + 一键源码运行脚本（`run_from_source.bat` / `.ps1`） |
 | `.github/workflows/release.yml` | 推 tag `v*` 自动构建发布（跑五套测试 → 构建 → Release） |
 
 ## 常用命令
@@ -53,12 +53,12 @@ python -m venv .buildenv
 python gui.py                    # 或 .buildenv\Scripts\python gui.py
 
 # 测试（纯脚本，非 pytest，失败退出码非 0）
-python tests/test_edge.py        # 边界 75 项，不碰真实设备
+python tests/test_edge.py        # 边界 87 项，不碰真实设备
 python tests/test_ipv6.py        # IPv6 报文级 65 项，不发包
 python tests/test_guard.py       # 本机守护 21 项，不发包
 python tests/test_sentinel.py    # 全网哨兵 12 项，不发包
 python tests/test_throttle.py    # 占空比限速 6 项，不发包
-python tests/test_gui_smoke.py   # GUI 冒烟 26 项，不发包（CI 也跑）
+python tests/test_gui_smoke.py   # GUI 冒烟 35 项，不发包（CI 也跑）
 python selftest.py               # GUI 端到端 51 项，驱动真实窗口（守护以演练模式）
 
 # 构建

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="https://img.shields.io/badge/version-v2.7.3-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.8.0-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/python-3.10%2B-8C9E93" alt="python">
 <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-8C9E93" alt="platform">
 <img src="https://img.shields.io/badge/license-学习研究用-C4A785" alt="license">
@@ -89,6 +89,10 @@ WiFiKill 是一个 Windows 桌面程序：把同一局域网里的设备列出�
 | ✅ 全部放行 | 回填真实映射，秒级恢复（IPv4 与 IPv6 阻断都算） | 稳定 |
 | 🐢 占空比限速 | 右键四档预设（80/50/20%）+ **自定义 10–100% 任意百分比**，逐台或批量 | 稳定 |
 | 🔎 验证断网 | 逐目标被动嗅探：出站帧被打到本机=已生效、仍走真实网关=未生效；限速目标单独判定 | 稳定 |
+| 🏷️ 设备名识别 | 被动嗅探 mDNS/LLMNR/NBNS/DHCP，把「厂商」升级为「这是哪台设备」（只读不发包） | 稳定 |
+| 📤 导出 | 设备清单与哨兵事件流导出 CSV/JSON（Excel 直开，含主机名/状态/备注） | 稳定 |
+| 🔠 搜索与排序 | 关键字过滤 IP/MAC/主机名/厂商/标识/备注；点表头排序 | 稳定 |
+| 🎓 教学演练 | `--dry-run` 启动即教学模式：绝不发真实报文（含一键源码运行脚本） | 稳定 |
 | 🛡️ 本机守护 | 核对并纠正网关真实映射，抵御 ARP/NDP 投毒；双源 fail closed | 稳定 |
 | 🗡️ 全网哨兵 | 设备基线库、新设备上线告警、投毒者指认（标注「疑似」）、事件流留痕 | 稳定 |
 | 🔗 IPv6 定向阻断 | 对**多个目标并发**做 NDP 投毒，只断经网关的出站（实验，默认关，全阻断可临时启用） | 实验 |
@@ -189,7 +193,7 @@ ARP 层做不了真限速。本程序的诚实做法是**占空比节流**：10 
 | `tray.py` | 托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、多目标 NDP 投毒与失控保护 |
 | `build.py` | 一键构建：版本自增 → 文档版本同步与**校验** → 三产物 |
-| `tests/` | 六套无头测试（205 项）+ GUI 冒烟（CI 可跑） |
+| `tests/` | 六套无头测试（226 项）+ GUI 冒烟（CI 可跑） |
 | `selftest.py` | 真机 GUI 端到端自检（51 项） |
 
 ## 安全设计
@@ -301,6 +305,30 @@ python gui.py
 
 **以管理员身份重启**：设置窗口左下角，一键 UAC 提权；会先恢复阻断再重启。
 
+### 设备名识别与导出
+
+- **设备名识别**：扫描完成后自动做一次 3 秒被动嗅探（mDNS / LLMNR / NBNS / DHCP），把主机名填进
+  「标识」列（人工备注优先）；只读本地广播，不发包、不联网上传，设置里可关闭。
+- **导出**：右键「导出设备清单…」或设置窗口的「导出设备清单… / 导出事件流…」，支持 CSV
+  （utf-8-sig，Excel 直接打开）与 JSON。
+- **搜索与排序**：右上搜索框按关键字过滤；点表头排序，再点一次反向；全选/反选只作用于可见行。
+
+### 教学 / 演练模式
+
+```bash
+WiFiKill.exe --dry-run        # 打包版：绝不发送真实报文
+python gui.py --dry-run       # 源码版
+```
+
+启动后顶部常驻黄色横幅提示「教学/演练模式：不会发送任何真实报文」，投毒与守护都只记录。
+
+### 源码一键运行（不打包、不签名）
+
+```bash
+tools\run_from_source.bat              # 首次会自动建 .buildenv 并安装 scapy
+tools\run_from_source.bat --dry-run    # 教学演练模式
+```
+
 ### 设置项
 
 | 设置项 | 默认 | 说明 |
@@ -344,6 +372,16 @@ python gui.py
 
 ---
 
+## 🚫 我们不做（避免误导性期待）
+
+| 不做的事 | 原因 |
+|---|---|
+| 本机侧真限速（按带宽限速） | ARP 层做不到；除非在你可控的网关上部署组件，本项目不做 |
+| 精确的每设备带宽统计 | 需要网关侧 SNMP/NetFlow；本机侧只能估算，宁可不做 |
+| 需要目标配合的能力（装客户端/改设置） | 目标是「零配合」的局域网工具 |
+| Linux / macOS 版本 | 维护成本翻倍，本项目只做 Windows 10/11 |
+| 代码签名证书 | 暂无预算；改为发布 SHA256SUMS + 一键源码运行脚本供核对 |
+
 ## 常见问题
 
 **Q：装完 Npcap 还提示未检测到？** 确认勾了 `WinPcap API-compatible Mode`，装完重启一次。
@@ -380,8 +418,8 @@ WiFi-Kill/
 ├── build.py              构建 + 版本自增 + 文档版本同步与校验
 ├── versions.json         版本真源
 ├── selftest.py           真机 GUI 自检（51 项）
-├── tests/                六套无头测试（205 项，含 GUI 冒烟 26 项）
-├── tools/                图标与概念图生成
+├── tests/                六套无头测试（226 项，含 GUI 冒烟 35 项）
+├── tools/                图标与概念图生成 + 一键源码运行脚本（run_from_source.*）
 ├── installer/            Inno Setup 脚本 + 中文语言 + 免责声明
 ├── docs/                 用户手册 / 技术手册 / images 概念图
 ├── .github/workflows/    推 tag：校验版本 → 跑测试 → 构建 → 发布
@@ -392,12 +430,12 @@ WiFi-Kill/
 ## 开发与测试
 
 ```bash
-python tests/test_edge.py        # 边界与故障路径 75 项
+python tests/test_edge.py        # 边界与故障路径 87 项
 python tests/test_ipv6.py        # IPv6 报文级 65 项
 python tests/test_guard.py       # 本机守护 21 项
 python tests/test_sentinel.py    # 全网哨兵 12 项
 python tests/test_throttle.py    # 占空比限速 6 项
-python tests/test_gui_smoke.py   # GUI 冒烟 26 项（不发包，CI 也跑）
+python tests/test_gui_smoke.py   # GUI 冒烟 35 项（不发包，CI 也跑）
 python selftest.py               # 真机端到端 51 项（驱动真实窗口）
 python build.py --bump patch     # 版本自增 + 文档同步与校验 + 三产物
 ```
@@ -413,7 +451,7 @@ python build.py --bump patch     # 版本自增 + 文档同步与校验 + 三产
 
 | 层 | 规模 | 说明 |
 |---|---|---|
-| 无头测试 | **205 项** | 边界 75 + IPv6 65 + 守护 21 + 哨兵 12 + 限速 6 + GUI 冒烟 26 |
+| 无头测试 | **226 项** | 边界 87 + IPv6 65 + 守护 21 + 哨兵 12 + 限速 6 + GUI 冒烟 35 |
 | 真机自检 | **51 项** | 真实窗口 + 扫描 + 幽灵设备端到端（限速/守护/哨兵/换网中止） |
 | 清单兜底 | 17 项 | 编译、红线、安全不变量、dry-run 纯净、版本一致、文档计数与实跑一致 |
 
@@ -421,9 +459,9 @@ python build.py --bump patch     # 版本自增 + 文档同步与校验 + 三产
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.7.3** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.7.3 | 面向使用者，含教程 A–P 与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.7.3 | 面向开发者，含报文/线程/状态机/测试/发布 |
+| 程序 | **v2.8.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.8.0 | 面向使用者，含教程 A–P 与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.8.0 | 面向开发者，含报文/线程/状态机/测试/发布 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增，程序与两份手册在构建时自动同步并**校验**（不一致即中止构建），

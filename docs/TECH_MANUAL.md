@@ -1,6 +1,6 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.7.3** · 对应程序：**v2.7.3** · 更新日期：2026-11-02
+> 文档版本：**v1.8.0** · 对应程序：**v2.8.0** · 更新日期：2026-11-02
 
 面向**开发者**：模块边界、报文、线程、状态机、安全护栏、测试体系与发布流水线。
 使用者请看 [USER_MANUAL.md](USER_MANUAL.md)。
@@ -93,6 +93,31 @@
 
 版本自增 → 文档版本同步 → **校验**（不一致即中止）→ 版本资源 → PyInstaller → Inno Setup → zip。
 详见 §12。
+
+### 2.11 设备名识别与导出（第 12 轮）
+
+`core.identify_hosts(ni, devices, seconds)`：**只读**嗅探 mDNS 5353 / LLMNR 5355 / NBNS 137 /
+DHCP 68，把 MAC 映射到主机名。四类解析器都是纯函数，可无网络单测：
+
+| 函数 | 输入 | 输出 |
+|---|---|---|
+| `name_from_dns_packet` | mDNS / LLMNR（DNS 报文） | 首个非 `_service` 记录，去掉 `.local` |
+| `name_from_nbns_packet` | NetBIOS 名称查询 | QName |
+| `name_from_dhcp_packet` | DHCP | hostname 选项 |
+| `hostname_from_packet` | 任意报文 | `(src_mac, name)`，源 MAC 非法即弃 |
+
+隐私边界：不发包、不做 UA 指纹、不联网上传；GUI 默认开启但可在设置里关闭，只影响「标识」列
+（优先级：人工备注 > 主机名 > 角色 > 随机 MAC > 厂商）。
+
+导出：`export_devices()`（CSV 用 utf-8-sig 供 Excel 直开；JSON 带 network 元信息与时间戳）、
+`export_events()`（哨兵事件流 CSV/JSON），写盘走 `export_json()` 原子替换。
+
+### 2.12 教学 / 演练模式与源码运行
+
+- `App(dry_run=True)`（命令行 `--dry-run`）：`self._opts = (interval, True)`，`Killer`/`Guard` 全走
+  dry-run 通道（只打印、不落盘、不动本机缓存），顶部常驻横幅；
+- `tools/run_from_source.bat|ps1`：首次自动建 venv 并装 scapy 后以 `gui.py` 启动，
+  适合核对源码或未购买代码签名证书的场景。
 
 ## 3. 关键数据结构
 
@@ -253,16 +278,16 @@ IDLE ──add()──► ARMED ──start()──► ACTIVE ⇄ (duty<100) THR
 
 ## 11. 测试体系
 
-### 11.1 六套无头测试（205 项，CI 可跑）
+### 11.1 六套无头测试（226 项，CI 可跑）
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/test_edge.py` | 75 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5–10 轮回归 |
+| `tests/test_edge.py` | 87 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5–10 轮回归 |
 | `tests/test_ipv6.py` | 65 | 报文级：NA 结构、组播保险、preflight、mDNS、邻居表解析 |
 | `tests/test_guard.py` | 21 | 守护：基准建立/重估/去抖/自愈/演练纯净 |
 | `tests/test_sentinel.py` | 12 | 哨兵：基线、告警、去重、认领/移出、事件上限、损坏自愈 |
 | `tests/test_throttle.py` | 6 | 占空比：档位、钳制、持久化、真循环交替 |
-| `tests/test_gui_smoke.py` | 26 | 真实建窗 + 扫描渲染 + 新功能入口 + `ui` 常量静态校验（不发包，进 CI） |
+| `tests/test_gui_smoke.py` | 35 | 真实建窗 + 扫描渲染 + 新功能入口 + `ui` 常量静态校验（不发包，进 CI） |
 
 ### 11.2 真机 GUI 端到端（`selftest.py`，51 项）
 
@@ -293,7 +318,7 @@ gitignore 覆盖、文档计数与实跑一致、`ui` 常量存在），任一�
 
 ### 12.3 安装包（`installer/WiFiKill.iss`）
 
-- `/DAppVersion=x.y.z` 传入版本，输出到 `dist/`；
+- `/DAppVersion=x.y.z` 传入版本，输出到 `dist/`；Release 另附 `SHA256SUMS.txt`（未签名，改用可校验）；
 - **`LicenseFile=DISCLAIMER.txt`**：首屏展示中文免责声明，必须勾选同意；
 - 安装 exe、README、两份手册、`docs/images/`（README 相对引用图片，缺图会裂）、许可；
 - 卸载清理 `.wifikill-state.json` / `whitelist.txt` / `aliases.json` / `guard.json` / `sentinel.json`。
@@ -324,7 +349,8 @@ gitignore 覆盖、文档计数与实跑一致、`ui` 常量存在），任一�
 6. **换网判定依赖扫描**：探测为空时不判换网（避免误杀），改为明确告警；
 7. **嗅探定位非定罪**：以太网源 MAC 可被冒用，指认结论标注「疑似」；
 8. **客户端隔离无法绕过**；
-9. 非 Windows 分支未验证。
+9. **设备名识别受设备行为限制**：只认 mDNS/LLMNR/NBNS/DHCP 广播，隐私模式下手机常不回，只能人工备注；
+10. 非 Windows 分支未验证。
 
 ## 14. 扩展点
 

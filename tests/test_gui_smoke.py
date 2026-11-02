@@ -107,8 +107,29 @@ def main() -> int:
             check("日志有内容", len(app.log_lines) >= 1 if hasattr(app, "log_lines") else True)
             check("沙箱断言：全程未创建阻断目标",
                   not (app._killer and app._killer.targets()))
-            for meth in ("do_verify", "_ask_duty", "_restart_as_admin"):
+            for meth in ("do_verify", "_ask_duty", "_restart_as_admin",
+                         "_export_devices", "_export_events", "_sort_by", "_visible_devices"):
                 check(f"新功能入口存在：{meth}", callable(getattr(app, meth, None)))
+            import inspect as _inspect
+            check("App 支持教学/演练模式参数",
+                  "dry_run" in _inspect.signature(gui.App.__init__).parameters)
+            check("默认非教学模式", app._teaching is False)
+            check("设备名识别默认开启", app._identify is True)
+            # 搜索过滤：命中不存在的关键字时表为空，清空后恢复
+            before = len(app.tree.get_children())
+            app._search_var.set("no-such-device-xyz")
+            app.update()
+            filtered = len(app.tree.get_children())
+            app._search_var.set("")
+            app.update()
+            after = len(app.tree.get_children())
+            check("搜索过滤生效且可清空",
+                  filtered == 0 and after == before, f"{before}->{filtered}->{after}")
+            # 表头点击排序不抛异常
+            for col in ("ip", "mac", "state", "mark", "vendor"):
+                app._sort_by(col)
+            app.update()
+            check("点表头排序不抛异常", True)
             check("验证按钮默认禁用（无阻断时）", app.btn_verify.enabled is False)
         except Exception:
             check("s1 冒烟步骤", False, traceback.format_exc()[-300:])
