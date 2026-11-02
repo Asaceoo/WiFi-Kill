@@ -452,6 +452,28 @@ def t_restore_frames_come_last():
 
 
 @case
+def t_verification_verdict():
+    """阻断验证的判据（纯函数）：吸到本机=生效，仍走真实网关=泄漏。"""
+    ok = core.verification_verdict(5, 0)
+    partial = core.verification_verdict(3, 2)
+    fail = core.verification_verdict(0, 4)
+    unknown = core.verification_verdict(0, 0)
+    check("吸到本机 → 已生效", ok[0] == "ok", ok)
+    check("有泄漏 → 部分生效", partial[0] == "partial", partial)
+    check("只泄漏 → 未生效", fail[0] == "fail", fail)
+    check("无帧 → 无法判定", unknown[0] == "unknown", unknown)
+    st = core.classify_target_frames(
+        "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03",
+        [("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"),
+         ("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:03"),
+         ("aa:bb:cc:dd:ee:01", "ff:ff:ff:ff:ff:ff"),
+         ("aa:bb:cc:dd:ee:99", "aa:bb:cc:dd:ee:02")])
+    check("分类只统计目标自己的帧", st == {"hits": 1, "leaks": 1, "other": 1}, st)
+    check("空帧安全", core.classify_target_frames("aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02",
+                                                "aa:bb:cc:dd:ee:03", [])["hits"] == 0)
+
+
+@case
 def t_arp_row_conversion():
     """WinAPI 邻居表行的转换（纯函数）：过滤无效/组播/广播，IP 字节序正确。"""
     rows = [
@@ -478,7 +500,7 @@ def main():
                t_network_change_abandons,
                # 第 7 轮：发送顺序 / 邻居表转换
                t_stale_generation_refuses_send, t_restore_frames_come_last,
-               t_arp_row_conversion):
+               t_arp_row_conversion, t_verification_verdict):
         fn()
 
     print("\n=========== 边界测试 ===========")

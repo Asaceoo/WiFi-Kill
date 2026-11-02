@@ -29,8 +29,8 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `tray.py` | 系统托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环，`notify()` 气泡通知 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、**多目标**定向 NDP 投毒（`NdpManager`/`NdpBlocker`，含 preflight 结构化护栏） |
 | `selftest.py` | GUI 端到端自检（51 项，含守护演练、哨兵链路、IPv6 可见性、换网中止） |
-| `tests/test_edge.py` | 边界与故障路径测试（61 项） |
-| `tests/test_gui_smoke.py` | GUI 冒烟测试（19 项，CI 可跑、绝不发包） |
+| `tests/test_edge.py` | 边界与故障路径测试（67 项） |
+| `tests/test_gui_smoke.py` | GUI 冒烟测试（24 项，CI 可跑、绝不发包） |
 | `tests/test_ipv6.py` | IPv6 报文级测试（58 项，CI 可跑） |
 | `tests/test_guard.py` | 本机守护单元测试（21 项，CI 可跑） |
 | `tests/test_sentinel.py` | 全网哨兵单元测试（11 项，CI 可跑） |
@@ -53,12 +53,12 @@ python -m venv .buildenv
 python gui.py                    # 或 .buildenv\Scripts\python gui.py
 
 # 测试（纯脚本，非 pytest，失败退出码非 0）
-python tests/test_edge.py        # 边界 61 项，不碰真实设备
+python tests/test_edge.py        # 边界 67 项，不碰真实设备
 python tests/test_ipv6.py        # IPv6 报文级 58 项，不发包
 python tests/test_guard.py       # 本机守护 21 项，不发包
 python tests/test_sentinel.py    # 全网哨兵 11 项，不发包
 python tests/test_throttle.py    # 占空比限速 6 项，不发包
-python tests/test_gui_smoke.py   # GUI 冒烟 19 项，不发包（CI 也跑）
+python tests/test_gui_smoke.py   # GUI 冒烟 24 项，不发包（CI 也跑）
 python selftest.py               # GUI 端到端 51 项，驱动真实窗口（守护以演练模式）
 
 # 构建

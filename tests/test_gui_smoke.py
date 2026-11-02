@@ -92,7 +92,7 @@ def main() -> int:
             cols = [str(c) for c in app.tree["columns"]]
             check("设备表列已定义", cols[:3] == ["no", "ip", "mac"], str(cols))
             for attr in ("btn_scan", "btn_block", "btn_all", "btn_free", "btn_guard",
-                         "btn_sel_all", "btn_sel_inv"):
+                         "btn_sel_all", "btn_sel_inv", "btn_verify"):
                 check(f"按钮存在：{attr}", hasattr(app, attr) and hasattr(getattr(app, attr), "enabled"))
             app.update()
             app._relayout(app._geo["w"], app._geo["h"])   # 强制一次布局，信息条才会生成
@@ -106,6 +106,9 @@ def main() -> int:
             check("日志有内容", len(app.log_lines) >= 1 if hasattr(app, "log_lines") else True)
             check("沙箱断言：全程未创建阻断目标",
                   not (app._killer and app._killer.targets()))
+            for meth in ("do_verify", "_ask_duty", "_restart_as_admin"):
+                check(f"新功能入口存在：{meth}", callable(getattr(app, meth, None)))
+            check("验证按钮默认禁用（无阻断时）", app.btn_verify.enabled is False)
         except Exception:
             check("s1 冒烟步骤", False, traceback.format_exc()[-300:])
 

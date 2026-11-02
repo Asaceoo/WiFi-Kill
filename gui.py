@@ -208,9 +208,12 @@ class App(tk.Tk):
                                            command=self._select_all, kind="ghost", font=b)
         self.btn_sel_inv = ui.CanvasButton(cv, "反选", 0, 0, 56, 34,
                                            command=self._select_invert, kind="ghost", font=b)
+        self.btn_verify = ui.CanvasButton(cv, "验证断网", 0, 0, 96, 34,
+                                          command=self.do_verify, kind="ghost", font=b)
         self.btn_guard = ui.CanvasButton(cv, "守护本机", 0, 0, 92, 34,
                                          command=self._toggle_guard, kind="ghost", font=b)
-        for x in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free):
+        for x in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free,
+                  self.btn_verify):
             x.set_enabled(False)
 
         self._badge_dot = None
@@ -315,7 +318,8 @@ class App(tk.Tk):
         ty = ny + card_h + 20
         bx = P
         for btn in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free,
-                    self.btn_sel_all, self.btn_sel_inv, self.btn_guard):
+                    self.btn_verify, self.btn_sel_all, self.btn_sel_inv,
+                    self.btn_guard):
             btn.x, btn.y = bx, ty
             self._place_btn(btn)
             bx += btn.w + 10
@@ -610,6 +614,7 @@ class App(tk.Tk):
         self.btn_block.set_enabled(idle and has)
         self.btn_all.set_enabled(idle and bool(self._devices))
         self.btn_free.set_enabled(idle and blocked)
+        self.btn_verify.set_enabled(idle and blocked)
         self._draw_footer()
 
     def _set_busy(self, busy: bool, text: str | None = None):
@@ -1027,8 +1032,20 @@ class App(tk.Tk):
             if not picks:
                 messagebox.showinfo("无可阻断设备", "除网关/本机/白名单外没有目标。")
                 return
-            if not messagebox.askyesno("确认全阻断",
-                                       f"将阻断 {len(picks)} 台设备。\n网关与本机已自动排除。\n\n继续？"):
+            if self._v6env and self._v6env.dual_stack and not self._ndp_on:
+                ans = messagebox.askyesnocancel(
+                    "全阻断（含 IPv6）",
+                    f"将阻断 {len(picks)} 台设备（网关与本机已自动排除）。\n\n"
+                    f"本网检测到 IPv6：是否同时切断它们的 IPv6 出站？\n"
+                    f"（实验功能，只断经网关的出站，每台独立护栏）")
+                if ans is None:
+                    return
+                if ans:
+                    self._ndp_on = True
+                    self.log("全阻断：本次已自动启用 IPv6 定向阻断（实验）", "warn")
+            elif not messagebox.askyesno(
+                    "确认全阻断",
+                    f"将阻断 {len(picks)} 台设备。\n网关与本机已自动排除。\n\n继续？"):
                 return
         else:
             ips = list(self.tree.selection())
@@ -1134,6 +1151,81 @@ class App(tk.Tk):
         if n:
             self.log(f"IPv6 阻断已停止，回填 {n} 次", "info")
         return n
+
+    def do_verify(self):
+        """逐个验证已阻断设备是否真的断网（被动嗅探，不发新包）。"""
+        targets = self._killer.targets() if self._killer else []
+        if not targets:
+            messagebox.showinfo("验证断网", "当前没有处于阻断状态的设备。", parent=self)
+            return
+        self._set_busy(True, "正在验证…")
+        ni = core.NetInfo(**self._killer.ni.__dict__)
+
+        def work():
+            result = core.verify_targets(ni, targets, seconds=4.0)
+
+            def done():
+                lines = []
+                for t in targets:
+                    r = result.get(t.ip) or {"status": "unknown", "text": "无结果",
+                                             "hits": 0, "leaks": 0}
+                    lines.append(f"{t.ip}  {r['text']}")
+                    self.log(f"[验证] {t.ip}：{r['text']}"
+                             f"（吸到本机 {r['hits']} 帧 / 直连网关 {r['leaks']} 帧）",
+                             "ok" if r.get("status") == "ok" else "warn")
+                self._set_busy(False)
+                messagebox.showinfo("验证断网", "\n".join(lines), parent=self)
+            self._post(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ask_duty(self):
+        """自定义占空比（10–100%）：对选中的已阻断设备生效。"""
+        if not self._killer or not self._killer.targets():
+            messagebox.showinfo("限速", "先阻断目标，再设置限速。", parent=self)
+            return
+        sel = [ip for ip in self.tree.selection()
+               if self._killer.duty_of(ip) is not None]
+        cur = self._killer.duty_of(sel[0]) if sel else 50
+        win = tk.Toplevel(self)
+        win.title("自定义限速")
+        win.configure(bg=ui.CARD)
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+        win.geometry(f"+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 240}")
+
+        body = tk.Frame(win, bg=ui.CARD, padx=22, pady=16)
+        body.pack(fill="both", expand=True)
+        var = tk.IntVar(value=int(cur or 50))
+        tk.Label(body, text="在线占空比：目标有多少比例的时间可以上网",
+                 bg=ui.CARD, fg=ui.TEXT, font=self.F["small"]).pack(anchor="w")
+        val = tk.Label(body, text=f"{var.get()}%", bg=ui.CARD, fg=ui.SAGE_DK,
+                       font=self.F["h1"])
+        val.pack(anchor="w", pady=(6, 0))
+        tk.Scale(body, from_=10, to=100, resolution=5, orient="horizontal",
+                 variable=var, length=320, bg=ui.CARD, fg=ui.TEXT,
+                 highlightthickness=0, troughcolor=ui.CARD_ALT, showvalue=False,
+                 command=lambda v: val.config(text=f"{int(float(v))}%")).pack(
+            anchor="w", pady=(4, 8))
+        tk.Label(body, text="100% = 全断；50% = 一半时间能上网（体感一直卡）",
+                 bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"]).pack(anchor="w")
+
+        def apply():
+            duty = max(10, min(100, int(float(var.get()))))
+            ips = sel or [t.ip for t in self._killer.targets()]
+            n = sum(1 for ip in ips if self._killer.set_duty(ip, duty))
+            self.log(f"已对 {n} 台设备设置占空比 {duty}%", "ok" if n else "warn")
+            self._render_rows()
+            win.destroy()
+
+        row = tk.Frame(body, bg=ui.CARD)
+        row.pack(fill="x", pady=(14, 0))
+        tk.Button(row, text="应用", command=apply, relief="flat", bd=0,
+                  bg=ui.SAGE, fg="#FFFFFF", font=self.F["small"], padx=18, pady=6,
+                  cursor="hand2", activebackground=ui.SAGE_DK).pack(side="right")
+        tk.Button(row, text="取消", command=win.destroy, relief="flat", bd=0,
+                  bg=ui.CARD_ALT, fg=ui.TEXT2, font=self.F["small"], padx=16, pady=6,
+                  cursor="hand2").pack(side="right", padx=8)
 
     def do_unblock_all(self):
         v4 = len(self._killer.targets()) if self._killer else 0
@@ -1365,10 +1457,13 @@ class App(tk.Tk):
         self.menu.add_command(label="阻断选中", command=lambda: self.do_block(False))
         self.menu.add_command(label="放行选中", command=self._unblock_selected)
         self.menu.add_separator()
+        self.menu.add_command(label="限速（自定义 %）…", command=self._ask_duty)
         self.menu.add_command(label="限速 80%（轻度）", command=lambda: self._set_duty(80))
         self.menu.add_command(label="限速 50%", command=lambda: self._set_duty(50))
         self.menu.add_command(label="限速 20%（重度）", command=lambda: self._set_duty(20))
         self.menu.add_command(label="取消限速（恢复全断）", command=lambda: self._set_duty(100))
+        self.menu.add_separator()
+        self.menu.add_command(label="验证是否已断网", command=self.do_verify)
         self.menu.add_separator()
         self.menu.add_command(label="加入白名单", command=lambda: self._wl(True))
         self.menu.add_command(label="移出白名单", command=lambda: self._wl(False))
@@ -1502,13 +1597,13 @@ class App(tk.Tk):
             self._post(done)
         threading.Thread(target=work, daemon=True).start()
 
-    def _quit(self):
+    def _quit(self, ask: bool = True):
         if self._quitting:
             return
         self._quitting = True
         active = self._killer.targets() if self._killer else []
         restore = True
-        if active:
+        if active and ask:
             try:
                 restore = messagebox.askyesno(
                     "退出 WiFiKill",
@@ -1532,6 +1627,30 @@ class App(tk.Tk):
                 pass
             self._post(self._finish)
         threading.Thread(target=work, daemon=True).start()
+
+    def _restart_as_admin(self):
+        """以管理员身份重启（UAC 提权后由新实例接管，本实例退出）。
+
+        为什么要有它：部分网卡默认拒绝普通用户发二层帧；顶部横幅只会提示，
+        没有入口的话用户只能自己去「右键 → 以管理员身份运行」再开一遍。
+        """
+        if core.is_admin():
+            messagebox.showinfo("以管理员身份重启", "当前已经是管理员权限。", parent=self)
+            return
+        n = len(self._killer.targets()) if self._killer else 0
+        if n and not messagebox.askyesno(
+                "以管理员身份重启",
+                f"仍有 {n} 台设备处于阻断状态。\n重启会先恢复它们，然后以管理员身份重新启动。\n\n继续？",
+                parent=self):
+            return
+        if not core.relaunch_elevated([]):
+            messagebox.showwarning(
+                "以管理员身份重启",
+                "未能启动提权实例（可能取消了 UAC 弹窗，或当前平台不支持）。\n"
+                "也可以手动右键 exe →「以管理员身份运行」。", parent=self)
+            return
+        self.log("正在以管理员身份重启…", "info")
+        self._quit(ask=False)
 
     def _finish(self):
         self._destroyed = True
@@ -1728,6 +1847,11 @@ class App(tk.Tk):
 
         btns = tk.Frame(body, bg=ui.CARD)
         btns.grid(row=10, column=0, columnspan=3, sticky="e", pady=(20, 0))
+        if not core.is_admin():
+            tk.Button(btns, text="以管理员身份重启", command=self._restart_as_admin,
+                      relief="flat", bd=0, bg=ui.SAND_BG, fg=ui.SAND_DK,
+                      font=self.F["small"], padx=14, pady=6,
+                      cursor="hand2", activebackground=ui.SAND_BG).pack(side="left")
         tk.Button(btns, text="取消", command=win.destroy, relief="flat", bd=0,
                   bg=ui.CARD_ALT, fg=ui.TEXT2, font=self.F["small"],
                   padx=16, pady=6, cursor="hand2").pack(side="right")

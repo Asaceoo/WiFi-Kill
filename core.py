@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.7.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -1694,7 +1694,79 @@ def sniff_poisoner(ni: "NetInfo", gw_ip: str, gw_mac: str,
     return ""
 
 
+# ---------------------------------------------------------------- 阻断验证
+
+
+def classify_target_frames(target_mac: str, my_mac: str, gw_mac: str, frames) -> dict:
+    """把抓到的帧归类（纯函数）：吸到本机 = 投毒生效；仍发往真实网关 = 泄漏。
+
+    判据来源：ARP 双向投毒生效后，目标发给网关的帧二层目的地址会变成**本机 MAC**，
+    这些帧会真的送到我们网卡上——嗅探里能看见；反之若仍看到「目标 → 真实网关 MAC」
+    的帧，说明目标缓存还是真实映射（投毒没生效或被回填）。
+    """
+    t = (target_mac or "").lower()
+    me = (my_mac or "").lower()
+    gw = (gw_mac or "").lower()
+    hits = leaks = other = 0
+    for src, dst in frames:
+        if src != t:
+            continue
+        if dst == me:
+            hits += 1
+        elif dst == gw:
+            leaks += 1
+        else:
+            other += 1
+    return {"hits": hits, "leaks": leaks, "other": other}
+
+
+def verification_verdict(hits: int, leaks: int) -> tuple[str, str]:
+    """把计数翻译成一句用户能看懂的话（纯函数，便于单测）。"""
+    if hits and not leaks:
+        return "ok", "已生效：目标的出站帧正被打到本机（它上不了网）"
+    if hits and leaks:
+        return "partial", "部分生效：仍有帧直接发给真实网关（目标可能在回填缓存）"
+    if leaks:
+        return "fail", "未生效：目标仍直连真实网关"
+    return "unknown", "无法判定：窗口内没抓到该目标的帧（设备可能空闲）"
+
+
+def sniff_target_frames(ni: "NetInfo", macs: set[str], seconds: float = 4.0):
+    """嗅探若干目标 MAC 发出的帧，返回 [(src_mac, dst_mac)]（只读，不发包）。"""
+    s = scapy_mod()
+    if s is None or not macs:
+        return []
+    from scapy.layers.l2 import Ether
+    out: list[tuple[str, str]] = []
+    try:
+        pkts = s.sniff(iface=ni.iface, timeout=max(0.5, float(seconds)), store=True,
+                       lfilter=lambda p: p.haslayer(Ether)
+                       and (p[Ether].src or "").lower() in macs)
+        out = [(p[Ether].src.lower(), p[Ether].dst.lower()) for p in pkts]
+    except Exception as e:
+        LOG.emit("debug", f"阻断验证嗅探失败：{e}")
+    return out
+
+
+def verify_targets(ni: "NetInfo", targets, seconds: float = 4.0) -> dict[str, dict]:
+    """逐个验证「这些目标是不是真的断了网」。
+
+    只做被动观测：嗅探 `seconds` 秒，看每个目标的出站帧到底发给了谁。
+    不额外发包（投毒帧由运行中的会话按 interval 正常发送）。
+    """
+    macs = {(getattr(t, "mac", "") or "").lower() for t in targets}
+    macs.discard("")
+    frames = sniff_target_frames(ni, macs, seconds)
+    out: dict[str, dict] = {}
+    for t in targets:
+        st = classify_target_frames(getattr(t, "mac", ""), ni.my_mac, ni.gateway_mac, frames)
+        code, text = verification_verdict(st["hits"], st["leaks"])
+        out[t.ip] = {"status": code, "text": text, **st}
+    return out
+
+
 # ------------------------------------------------------------------ 单实例锁
+
 
 
 class SingleInstance:
