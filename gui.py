@@ -749,6 +749,8 @@ class App(tk.Tk):
         # 守护本机：同步最新网络上下文；若已开启则确保运行（扫描自愈，断网重连也能恢复）
         self._guard.ni = ni
         self._guard.v6env = self._v6env
+        if self._guard.is_active():
+            self._guard.refresh_v6()   # 网络切换重估后恢复 IPv6 重宣告上下文
         if self._guard_on and not self._guard.is_active():
             self._guard.dry_run = self._opts[1]
             self._guard.start()

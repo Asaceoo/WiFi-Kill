@@ -730,6 +730,14 @@ class Killer:
     # --- 生命周期 ---
 
     def start(self):
+        # 防并发（与 Guard.start 同源）：stop() 后旧投毒线程未退出前不重复启动，
+        # 避免双线程并发 _loop 重复发包。
+        old = self._thread
+        if old is not None and old.is_alive() and self._stop.is_set():
+            old.join(timeout=3)
+            if old.is_alive():
+                LOG.emit("warn", "投毒线程尚未退出，本次不重复启动")
+                return
         with self._lock:
             if self.is_active():
                 return
@@ -1063,6 +1071,27 @@ class Guard:
                     self._rebaseline()
 
         self._maybe_v6(v6)
+
+    def refresh_v6(self):
+        """扫描后刷新 IPv6 重宣告上下文（守护线程运行中调用）。
+
+        网络切换重估会把 _v6 置空；此后守护线程仍在运行，若无人重新注入，
+        IPv6 重宣告将静默失效到下次启停。只在 env 的网关 MAC 与当前 IPv4
+        基准**一致**时采纳 —— 不一致说明上下文与基准不同源，宁可不用。
+        """
+        if not self.is_active():
+            return
+        env = self.v6env
+        if env is None or not getattr(env, "supported", False):
+            return
+        gw_lla, gw_mac, my_lla = env.gw_lla, env.gw_mac, getattr(env, "my_lla", "")
+        if not (gw_lla and gw_mac and my_lla):
+            return
+        with self._lock:
+            if gw_mac.lower() != self._gw_mac:
+                LOG.emit("debug", "守护 IPv6 上下文与基准 MAC 不一致，暂不启用重宣告")
+                return
+            self._v6 = (gw_lla, gw_mac.lower(), my_lla, self.ni.iface)
 
     def _rebaseline(self):
         """重估守护基准（网络切换 / 纠正反复不生效时调用）。

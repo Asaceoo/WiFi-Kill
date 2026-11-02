@@ -477,7 +477,7 @@ Npcap 安装时的选项决定了普通用户能否发帧。以 admin 作为门�
 | `t_logger_isolation` | 日志回调抛错被隔离 |
 | `t_protected_device` | 网关/本机被标记受保护、普通设备不受保护、单目标过滤只留普通设备、仅选网关无可阻断目标（v2.3.0 新增） |
 
-### 11.2 IPv6 报文级 `tests/test_ipv6.py`（51 项）
+### 11.2 IPv6 报文级 `tests/test_ipv6.py`（58 项）
 
 不碰网卡、不发一个包 —— CI（ubuntu-latest，无 Npcap）也能跑：
 
@@ -553,7 +553,7 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 > 因此无法对其 LLA 做**端到端 IPv6 阻断**——这正是 §13 记录的已知限制，
 > 并非缺陷。IPv6 的报文构造、安全闸、单播上线与网关可达性均已真实验证。
 
-### 11.6 守护单元测试 `tests/test_guard.py`（17 项）
+### 11.6 守护单元测试 `tests/test_guard.py`（18 项）
 
 不碰真实网络，网络层全部用 fake 注入，断言「只发真实网关映射、不冒充、有去抖、dry_run 不发包」：
 
@@ -576,6 +576,7 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 | `rebaseline_fail_closed_when_disagreement` | 重估时分歧 → 清空基准 fail closed，不新增发包 |
 | `cache_missing_debounce` | 缓存缺失与漂移共用去抖，连续 2 次才宣告；缺失不计投毒 |
 | `start_rejects_when_old_thread_alive` | stop 后旧线程未退出时 start 拒绝（防双线程并发） |
+| `refresh_v6_after_rebaseline` | 重估清空 _v6 后恢复一致上下文；env 与基准分歧时保持关闭 |
 
 ---
 

@@ -368,6 +368,13 @@ class NdpBlocker:
             return False, "目标没有链路本地地址，无法定向投毒"
         if not _valid_mac(self.target_mac) or not _valid_mac(self.env.gw_mac):
             return False, "MAC 格式非法"
+        # 结构化受保护校验（对抗性审查 N1）：目标就是网关自身时必须拒绝，
+        # 这是与 NdpManager 互相独立的一道 —— 任何直接构造 NdpBlocker 的
+        # 调用方都无法绕过。
+        if self.target_lla.split("%")[0].lower() == self.env.gw_lla.split("%")[0].lower():
+            return False, "目标 LLA 即网关自身（受保护设备），拒绝"
+        if self.target_mac == self.env.gw_mac.lower():
+            return False, "目标 MAC 即网关自身（受保护设备），拒绝"
         return True, "ok"
 
     def start(self) -> tuple[bool, str]:
@@ -620,6 +627,14 @@ class NdpManager:
         dev_ip = getattr(dev, "ip", "?")
         if not (env and env.dual_stack):
             return False, "本网未检测到 IPv6，跳过 IPv6 阻断"
+        # 结构化受保护校验（对抗性审查 N1）：不信任 note 标注 —— 直接比对
+        # IP/MAC。note 可能缺失（扫描抖动、直接 API 调用），而 IP 或 MAC
+        # 任一命中网关/本机都必须拒绝（与 core.Killer._is_protected_target 同源）。
+        bad_ips = {getattr(ni, "gateway_ip", ""), getattr(ni, "my_ip", "")}
+        bad_macs = {(getattr(ni, "gateway_mac", "") or "").lower(),
+                    (getattr(ni, "my_mac", "") or "").lower()}
+        if dev.ip in bad_ips or (getattr(dev, "mac", "") or "").lower() in bad_macs:
+            return False, f"{dev_ip} 是受保护设备（网关/本机），IPv6 不可阻断"
         if getattr(dev, "note", "") in ("网关", "本机"):
             return False, f"{dev_ip} 是受保护设备（网关/本机），IPv6 不可阻断"
 
@@ -632,7 +647,13 @@ class NdpManager:
         if not ok:
             return False, f"IPv6 定向阻断未启动：{why}"
         with self._lock:
+            old = self._blockers.pop(dev.ip, None)   # 同 IP 重复添加：先停旧实例，防空转泄漏
             self._blockers[dev.ip] = blocker
+        if old is not None:
+            try:
+                old.stop(restore=True)
+            except Exception:
+                pass
         return True, f"IPv6 定向阻断已生效：{dev_ip} → {lla}（来源 {how}）"
 
     def remove(self, ip: str, restore: bool = True) -> int:

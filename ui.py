@@ -185,6 +185,8 @@ class CanvasButton:
 
     def set_enabled(self, on: bool):
         self.enabled = bool(on)
+        # 递增动画代数：飞行中的换肤插值立即退场，避免覆盖禁用/启用配色
+        self._anim_gen = getattr(self, "_anim_gen", 0) + 1
         if not on:
             self._hover = 0.0
             self.cv.itemconfig(self.bg, fill=mix(CARD_ALT, BG, 0.5))
@@ -217,8 +219,14 @@ class CanvasButton:
             pass
         state = {"i": 0}
         steps = 9
+        # 动画代数令牌（对抗性审查 G1）：连续两次 set_kind 时，旧插值循环必须
+        # 立即退场 —— 否则两个循环并发写同一组颜色字段，后结束的旧循环会把
+        # 按钮定格在旧配色，与 self.kind 状态不一致。
+        gen = self._anim_gen = getattr(self, "_anim_gen", 0) + 1
 
         def tick():
+            if gen != getattr(self, "_anim_gen", 0):
+                return          # 已被更新的动画/启停接管
             state["i"] += 1
             p = ease_out(state["i"] / steps)
             self._c_base = mix(ob, base, p)
@@ -231,7 +239,7 @@ class CanvasButton:
                 return
             if state["i"] < steps:
                 self.cv.after(14, tick)
-            else:
+            elif gen == self._anim_gen:
                 self._c_base, self._c_hover, self._c_fg, self._c_bd = base, hover, fg, bd
 
         tick()

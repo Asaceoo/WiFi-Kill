@@ -280,6 +280,52 @@ def test_ndp_manager_rejects_no_dual_stack():
     check("非双栈被拒", not ok, msg)
 
 
+@case
+def test_ndp_manager_rejects_protected_without_note():
+    """对抗性审查 N1：note 标注缺失（空串）时，IP/MAC 命中网关/本机仍必须被拒。"""
+    env = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                     my_lla=MY_LLA, prefixes=["2409:8a55::/64"])
+
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+        my_ip = "10.0.0.2"
+        gateway_ip = "10.0.0.1"
+        gateway_mac = GW_MAC
+
+    mgr = ipv6.NdpManager()
+    ok, msg = mgr.add(FakeNI(), env,
+                      core.Device(ip="10.0.0.1", mac="aa:aa:aa:aa:aa:01", note=""), 1.5)
+    check("网关 IP 被拒(无 note)", not ok and "受保护" in msg, msg)
+    ok, msg = mgr.add(FakeNI(), env,
+                      core.Device(ip="10.0.0.9", mac=GW_MAC, note=""), 1.5)
+    check("网关 MAC 被拒(无 note)", not ok and "受保护" in msg, msg)
+    ok, msg = mgr.add(FakeNI(), env,
+                      core.Device(ip="10.0.0.2", mac="aa:aa:aa:aa:aa:02", note=""), 1.5)
+    check("本机 IP 被拒(无 note)", not ok and "受保护" in msg, msg)
+    check("被拒目标未入列", mgr.active_ips() == [])
+
+
+@case
+def test_preflight_rejects_gateway_as_target():
+    """对抗性审查 N1：目标 LLA/MAC 就是网关自身时，NdpBlocker.preflight 独立拒绝。"""
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    env = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                     my_lla=MY_LLA, prefixes=["2409::/64"])
+    ok, why = ipv6.NdpBlocker(FakeNI(), env, "192.168.1.9",
+                              GW_MAC, GW_LLA).preflight()
+    check("网关自身作为目标被拒", not ok and "受保护" in why, why)
+    ok, why = ipv6.NdpBlocker(FakeNI(), env, "192.168.1.9",
+                              TGT_MAC, GW_LLA).preflight()
+    check("网关 LLA 作为目标被拒", not ok and "受保护" in why, why)
+    ok, _ = ipv6.NdpBlocker(FakeNI(), env, "192.168.1.9",
+                            TGT_MAC, TGT_LLA).preflight()
+    check("正常目标不受影响", ok)
+
+
 if __name__ == "__main__":
     for fn in (
         test_na_structure,
@@ -295,6 +341,8 @@ if __name__ == "__main__":
         test_ndp_manager_multi_target,
         test_ndp_manager_rejects_protected,
         test_ndp_manager_rejects_no_dual_stack,
+        test_ndp_manager_rejects_protected_without_note,
+        test_preflight_rejects_gateway_as_target,
     ):
         fn()
 

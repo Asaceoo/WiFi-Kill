@@ -326,6 +326,36 @@ def test_guard_start_rejects_when_old_thread_alive(monkeypatch):
         g._thread = None
 
 
+def test_guard_refresh_v6_after_rebaseline(monkeypatch):
+    """G2：网络切换重估清空 _v6 后，refresh_v6 应恢复与基准一致的上下文；
+    env 网关 MAC 与基准不一致时保持关闭（fail closed）。"""
+    g, fake = _mk_guard(monkeypatch)
+    release = threading.Event()
+    holder = threading.Thread(target=release.wait, daemon=True)
+    holder.start()
+    g._thread = holder                   # _stop 未 set → is_active() 为 True
+    try:
+        class Env:
+            supported = True
+            gw_lla = "fe80::1"
+            gw_mac = g._gw_mac           # 与基准一致
+            my_lla = "fe80::50"
+
+        g.v6env = Env()
+        g._v6 = None
+        g.refresh_v6()
+        assert g._v6 is not None and g._v6[0] == "fe80::1", "一致上下文应被恢复"
+
+        g._v6 = None
+        Env.gw_mac = "de:ad:be:ef:99:99"  # 与基准分歧
+        g.refresh_v6()
+        assert g._v6 is None, "分歧的 v6 上下文不得启用"
+    finally:
+        release.set()
+        holder.join(timeout=2)
+        g._thread = None
+
+
 if __name__ == "__main__":
     import sys
 
