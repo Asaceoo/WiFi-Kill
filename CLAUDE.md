@@ -10,7 +10,7 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 持续核对并纠正网关真实映射，抵御外部 ARP/NDP 投毒；「全网哨兵（Sentinel）」设备基线库——
 新设备上线告警、投毒者指认、事件流留痕。
 纯标准库 + scapy，零第三方 UI 库；PyInstaller 单文件打包 + Inno Setup 安装版 + 打包版 zip。
-当前版本 **v2.6.0**（版本真源 `versions.json`）。
+当前版本 **v2.6.1**（版本真源 `versions.json`）。
 
 ## 技术栈与运行环境
 
