@@ -6,6 +6,9 @@ dist/
 .wifikill-state.json
 whitelist.txt
 
+# 设备备注运行时状态
+aliases.json
+
 # 自检脚本产出的截图
 t[0-9]*_*.png
 
@@ -15,3 +18,9 @@ selftest_out.txt
 
 # 哨兵基线
 sentinel.json
+
+# 原子写的中间文件
+*.tmp
+
+# PyInstaller 生成的 spec（含本机绝对路径，勿提交）
+*.spec

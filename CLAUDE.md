@@ -28,16 +28,16 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `ui.py` | 视觉层：莫兰迪色板、圆角绘制、Canvas 按钮（换肤带动画代数令牌）、动效调度 `ui.Anim` |
 | `tray.py` | 系统托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环，`notify()` 气泡通知 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、**多目标**定向 NDP 投毒（`NdpManager`/`NdpBlocker`，含 preflight 结构化护栏） |
-| `selftest.py` | GUI 端到端自检（46 项，含守护演练与哨兵链路） |
-| `tests/test_edge.py` | 边界与故障路径测试（34 项） |
+| `selftest.py` | GUI 端到端自检（51 项，含守护演练、哨兵链路、IPv6 可见性、换网中止） |
+| `tests/test_edge.py` | 边界与故障路径测试（52 项） |
 | `tests/test_ipv6.py` | IPv6 报文级测试（58 项，CI 可跑） |
 | `tests/test_guard.py` | 本机守护单元测试（21 项，CI 可跑） |
-| `tests/test_sentinel.py` | 全网哨兵单元测试（10 项，CI 可跑） |
+| `tests/test_sentinel.py` | 全网哨兵单元测试（11 项，CI 可跑） |
 | `tests/test_throttle.py` | 占空比限速单元测试（6 项，CI 可跑） |
 | `build.py` | 一键构建 + 语义化版本自增 + 文档版本同步 |
 | `versions.json` | 版本真源（app / user_manual / tech_manual / build / released） |
-| `WiFiKill.spec` | PyInstaller 配置 |
-| `installer/` | Inno Setup 脚本与中文语言文件 |
+| `installer/` | Inno Setup 脚本 + 中文语言文件 + `DISCLAIMER.txt`（向导首屏 LicenseFile） |
+| `docs/` | 两份手册 + `images/` 概念图（README/手册相对引用，随 zip 与安装包分发） |
 | `tools/` | 图标与概念图生成（`make_images.py` 含 `make_guard`） |
 | `.github/workflows/release.yml` | 推 tag `v*` 自动构建发布（跑五套测试 → 构建 → Release） |
 
@@ -52,18 +52,22 @@ python -m venv .buildenv
 python gui.py                    # 或 .buildenv\Scripts\python gui.py
 
 # 测试（纯脚本，非 pytest，失败退出码非 0）
-python tests/test_edge.py        # 边界 34 项，不碰真实设备
+python tests/test_edge.py        # 边界 52 项，不碰真实设备
 python tests/test_ipv6.py        # IPv6 报文级 58 项，不发包
 python tests/test_guard.py       # 本机守护 21 项，不发包
-python tests/test_sentinel.py    # 全网哨兵 10 项，不发包
+python tests/test_sentinel.py    # 全网哨兵 11 项，不发包
 python tests/test_throttle.py    # 占空比限速 6 项，不发包
-python selftest.py               # GUI 端到端 46 项，驱动真实窗口（守护以演练模式）
+python selftest.py               # GUI 端到端 51 项，驱动真实窗口（守护以演练模式）
 
 # 构建
 python build.py --bump minor     # 语义化版本自增 + 文档同步 + 出三产物
 python build.py --no-bump        # 用当前版本重新打包（调试）
 python build.py --zip-only       # 只出打包版 zip
 ```
+
+发布：`python build.py [--bump patch]` → 提交（含 versions.json 与文档）→ `git tag vX.Y.Z` →
+`git push origin main --tags`。CI 先校验 tag 与 versions.json 一致，再跑五套测试、构建三产物、
+发布 Release（附 README 与两份手册）。
 
 ## 环境变量
 
@@ -80,11 +84,16 @@ python build.py --zip-only       # 只出打包版 zip
    演练模式（dry_run）绝不发送真实包、**绝不触碰本机 ARP/NDP 缓存**。
 3. **core.py 禁止 import tkinter**：逻辑层必须可被脚本 / 测试 / 未来 CLI 复用。
 4. **不提交构建产物**：`dist/`、`build/`、`.buildenv/`、`__pycache__/`、`.wifikill-state.json`、
-   `whitelist.txt`、`guard.json`、`sentinel.json`、`selftest_out.txt`、`t[0-9]*_*.png` 均已 gitignore。
+   `whitelist.txt`、`aliases.json`、`guard.json`、`sentinel.json`、`selftest_out.txt`、
+   `t[0-9]*_*.png`、`*.tmp`（原子写的中间文件）均已 gitignore。
 5. **测试保持纯脚本语义**：`sys.exit(1 if FAIL)`；CI 已设 `PYTHONUTF8=1`，中文输出不崩溃。
 6. **改动动效 / 图标后跑 `selftest.py`**；构建前跑全量测试（边界 + IPv6 + 守护 + 哨兵 + 限速 + 自检）；
    打 tag 前核对 `release.yml` 的发布说明 body 是否与版本内容一致。
-7. **ui.py 常量先用先查**：引用 `ui.XXX` 前确认常量存在（OK_DK/OLIVE_DK 曾两次缺失，
+7. **文档版本标记是构建契约**：README 的版本徽章/版本表/手册行与两份手册的
+   `文档版本 / 对应程序` 头部格式由 `build.py:verify_doc_versions()` 校验，
+   改格式必须同步改校验逻辑，否则构建直接失败；三份文档（README/USER_MANUAL/TECH_MANUAL）
+   必须保留免责声明，安装向导以 `LicenseFile` 展示 `installer/DISCLAIMER.txt`。
+8. **ui.py 常量先用先查**：引用 `ui.XXX` 前确认常量存在（OK_DK/OLIVE_DK 曾两次缺失，
    无头测试抓不到、真机渲染即崩）；core.py 内调用自身模块函数直接用裸名，禁止 `core.xxx` 自引用。
 
 ## 设计原则
@@ -97,14 +106,17 @@ python build.py --zip-only       # 只出打包版 zip
 - 线程启停一律「防并发」：`start()` 前先 join 尚未退出的旧线程（`Guard` / `Killer` 同源模式）；
   UI 动画用代数令牌（`_anim_gen`），旧动画循环在新动画/启停开始时立即退场。
 - 广播帧不会回环本机协议栈：跨机纠正靠重宣告，本机自愈靠 `arp -d` 删除脏缓存后重建。
+- 长生命周期对象不得持有过期网络快照：`Killer` 存的是创建时的 `NetInfo`，每次扫描后必须用
+  `matches_network()` 比对、不一致就 `abandon()`，否则表现为「界面阻断中、目标照常上网」；
+  状态文件解析一律走 `core.state_targets()`，不要在 GUI 里手抠字段（第 5 轮真实缺陷）。
 
 ## 深入文档
 
 | 文档 | 受众 | 内容 |
 |---|---|---|
-| `README.md` | 人类 | 入门 + 概念图 + 20 个使用实例 + 免责声明 |
-| `docs/USER_MANUAL.md` | 使用者 | 完整操作步骤 + 故障排查（v1.6.0） |
-| `docs/TECH_MANUAL.md` | 开发者 | 报文结构 / 线程模型 / 测试 / 打包（v1.6.0） |
+| `README.md` | 人类 | 快速开始 + 概念图 + 用法与使用说明 + 20 个使用实例 + 免责声明 |
+| `docs/USER_MANUAL.md` | 使用者 | 完整操作步骤 + 故障排查（文档 v1.6.1 / 程序 v2.6.1） |
+| `docs/TECH_MANUAL.md` | 开发者 | 报文结构 / 线程模型 / 测试 / 打包（文档 v1.6.1 / 程序 v2.6.1） |
 | `CHANGELOG.md` | 所有人 | 每个版本改了什么 |
 
 <!-- neat-freak: initialized at 2026-11-02 -->

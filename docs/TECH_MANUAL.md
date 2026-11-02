@@ -1,770 +1,360 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.6.1** · 对应程序：**v2.6.1** · 更新日期：2026-11-02
+> 文档版本：**v1.6.2** · 对应程序：**v2.6.2** · 更新日期：2026-11-02
+
+面向**开发者**：模块边界、报文结构、线程模型、状态机、安全护栏、测试体系与发布流水线。
+使用者请看 [USER_MANUAL.md](USER_MANUAL.md)。
 
 ---
 
 ## ⚠️ 免责声明
 
-本仓库提供的代码与文档仅用于**自有网络**或**已获书面授权**的安全测试、教学与研究。
-
-未经授权使用 ARP 欺骗干扰他人网络通信，可能违反《中华人民共和国网络安全法》第二十七条、
-《治安管理处罚法》第二十九条，情节严重可触犯《刑法》第二百八十五条、第二百八十六条；
-境外同样受 CFAA §1030、Computer Misuse Act 1990 s.3 等条款约束。
-
-**作者不对任何滥用行为承担责任。**
+> 本项目仅用于**自有网络或已获书面授权**的安全测试、教学演示与研究。
+> 未经授权干扰他人网络通信可能违反《网络安全法》第二十七条、《治安管理处罚法》第二十九条；
+> 情节严重可触犯《刑法》第二百八十五条、第二百八十六条。
+> **作者不对任何滥用行为承担责任。** 代码中的安全护栏用于降低误用风险，不构成使用授权。
 
 ---
 
 ## 1. 定位与技术栈
 
+WiFiKill 是 Windows 桌面 GUI 工具：设备发现 → ARP/NDP 定向投毒阻断 → 本机主动防御 → 全网哨兵。
+
 | 项 | 值 |
 |---|---|
-| 语言 | Python 3.10+ |
-| UI | Tkinter / ttk（标准库，无第三方 UI 依赖） |
-| 抓包与注入 | scapy 2.8 + Npcap（Windows）/ libpcap（Linux） |
-| 打包 | PyInstaller 6.x，`--onefile --windowed` |
-| 产物体积 | 约 16.8 MB（排除 numpy/PIL 等非必需依赖后） |
-| 代码规模 | core.py ≈ 730 行，gui.py ≈ 780 行 |
-
-设计约束（刻意的）：
-
-1. **core 不向 stdout 写任何东西** —— `--windowed` 打包后 `sys.stdout is None`，任何 print 都会崩。
-2. **core 不引用 tkinter** —— 保证逻辑层可被脚本、测试、未来的 CLI 复用。
-3. **零第三方 UI 库** —— 避免 Qt 那类 100 MB+ 的打包体积。
-
----
+| 语言 / 运行时 | Python 3.10+（构建与 CI 用 3.12，需自带 tkinter） |
+| 报文与抓包 | scapy 2.8.0 + Npcap（Windows；安装需勾选 `WinPcap API-compatible Mode`） |
+| GUI | tkinter / ttk + Canvas 自绘（零第三方 UI 库） |
+| 打包 | PyInstaller（单文件）+ Inno Setup 6（安装版） |
+| 平台 | 仅 Windows 10/11；代码保留非 Windows 分支但未验证 |
+| 环境变量 | **不使用任何环境变量**（`grep os.environ/getenv` 零命中，引入即破坏约定） |
 
 ## 2. 模块边界
 
-```
-gui.py  ──── 依赖 ────►  core.py  ──── 依赖 ────►  scapy / Npcap
-   │                        │
-   └─ Tk 主循环             └─ 工作线程池（每次操作一个 thread）
-```
-
-| 模块 | 允许做的事 | 禁止做的事 |
+| 文件 | 层 | 职责 |
 |---|---|---|
-| `gui.py` | 创建控件、读取控件、派发任务到线程、从队列取结果 | 直接调用 `sendp`、在 Tk 线程里做超过 50 ms 的阻塞调用 |
-| `core.py` | 计算、发包、读写状态文件、通过 `LOG` 回调上报 | 触碰任何 Tk 对象、向 stdout/stderr 输出 |
-| `ipv6.py` | IPv6 路由表读取、报文构造、定向投毒、自检 | 发往组播/广播地址、触碰 Tk、并发多目标 |
+| `core.py` | 逻辑 | 设备发现、报文构造、阻断会话、限速、状态持久化、单实例锁、白名单、安全不变量、`Guard`、`Sentinel` |
+| `ui.py` | 视觉 | 莫兰迪色板、圆角绘制、Canvas 按钮（hover/press 插值）、波纹/光晕/呼吸灯、`ui.Anim` 调度器 |
+| `gui.py` | 表现 | 主窗口编排、工作线程 + 队列回主线程、右键菜单、设置窗口、哨兵面板、托盘接线 |
+| `tray.py` | 集成 | 纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环，`notify()` 气泡 |
+| `ipv6.py` | 协议 | IPv6 环境探测、LLA 探明（嗅探/mDNS）、多目标 NDP 投毒、三道失控保护 |
 
-跨层通信只有两条通道：
+硬约束：**`core.py` 不 import tkinter**（逻辑层必须能被脚本/测试/未来 CLI 直接复用）；
+UI 只消费 `core` 的返回值，不反向依赖。
 
-- **下行**：`gui` 调 `core` 的函数/方法（在工作线程里）
-- **上行**：`core.LOG.emit(level, msg)` → `gui._log_sink` → `queue` → `_drain`（主线程）
+### 2.1 阻断会话（`core.Killer`）
 
----
+- 持有 `NetInfo` 快照、目标队列 `dict[ip -> Target]`、一个投毒线程、`interval`、`dry_run`；
+- `add()` 先在 API 层校验受保护设备 → 验证报文可构造 → 入队 → **首发成功才 persist**，失败回滚；
+- `remove()` 发送恢复帧 5 次，失败则把目标放回队列（避免「以为放行了其实还断着」）；
+- `abandon()` 用于换网：停线程、丢队列、清状态文件，**不回填**（旧网关帧在新网段无意义）；
+- `matches_network(ni)` 比对网卡 / 网关 IP / 网关 MAC，**两侧都非空**才算不一致。
 
-## 2.5 IPv6 / NDP 层（v2.1.0 新增）
+### 2.2 限速（占空比）
 
-### 为什么必须做
+- `Target.duty`（10–100）：100 = 恒投毒；`p` = 10 拍周期里阻断 `round(p/10)` 拍，其余拍发恢复帧；
+- 决策函数 `_should_poison(t, cycle_idx)` 是纯函数，便于测试；
+- `set_duty()` / `duty_of()` 对外接口，`duty` 进 `asdict()` 随状态落盘，恢复路径必须读回。
 
-ARP 是纯 IPv4。国内宽带普遍 RA + SLAAC 下发全局 IPv6，双栈设备访问双栈站点时
-按 RFC 6724 优先走 IPv6，这些帧直接发往路由器的真实 MAC，**绕过投毒方**，
-于是出现「界面显示阻断中、目标照常上网」的静默失效。
+### 2.3 IPv6 层（`ipv6.py`）
 
-### 报文
+- `probe_env()`：只读 `conf.route6`，得出 `supported / gw_lla / my_lla / prefixes`；
+- `find_lla()`：被动嗅探（`AsyncSniffer`，只读不发）→ mDNS 主动询问（QU 位必须为 1）兜底；
+- `NdpBlocker`：单目标 NDP 投毒 + 监听目标 NS 代为应答（否则 NUD 会自愈）+ `_watchdog` 自检；
+- `NdpManager`：多目标并发管理，逐目标独立护栏，`active_ips()` / `state_of()` 供 UI 展示。
 
-```
-Ether(14) / IPv6(40) / ICMPv6 NA(32) = 86 字节
+### 2.4 本机守护（`core.Guard`）
 
-  ICMPv6 type = 136 (Neighbor Advertisement)
-  tgt         = 被冒充的地址（这里是网关链路本地地址，如 fe80::1）
-  O = 1       覆盖已有缓存项，这是投毒生效的关键位
-  S = 0       非请求应答；代理应答对方 NS 时才置 1
-  选项        携带「tgt 现在在哪个 MAC 上」
-```
+见 §2.7。它**只发真实映射**：免费 ARP / 单播 NA 宣告「网关 IP/LLA ↔ 真实网关 MAC」，
+L2 源用本机 MAC（不冒充网关）；基准必须「缓存 + 实时询问」双源一致。
 
-### 三个方向的帧
+### 2.5 全网哨兵（`core.Sentinel`）
 
-| 方向 | 以太目的 | IPv6 源 | 宣称内容 |
-|---|---|---|---|
-| 正向投毒 | 目标 MAC | 网关 LLA | 网关 LLA 在本机 MAC 上 |
-| 反向投毒 | 网关 MAC | 目标 LLA | 目标 LLA 在本机 MAC 上 |
-| 回填（各 5 次） | 各自真实 MAC | 真实地址 | 真实映射 |
-
-### 为什么光投毒不够
-
-目标收不到回应会触发 NUD（邻居不可达检测）：先单播 NS 探测，探不通就删缓存、
-重新组播询问，真路由器一应答就自动修好了。所以必须**同时监听目标的 NS 并代为应答**
-（`_start_ns_sniffer`）。这与 ARP 侧「每 1.5 秒重发」是同一个道理，但更复杂。
-
-### 三道防线
-
-| 防线 | 实现位置 | 作用 |
-|---|---|---|
-| 结构性保险 | `NdpBlocker._send()` | 拒绝任何组播/广播目的 MAC；一条 NA 发不到 `ff02::1`，就断不了整网 |
-| 人工门 | 设置项 + `do_block` | 默认关闭；开启后 `len(picks) > 1` 直接拒绝 |
-| 运行时自检 | `NdpBlocker._watchdog()` | 每 5 个周期查本机邻居表里网关是否仍指向真实 MAC，异常立即停手回填 |
-
-### 目标地址发现
-
-定向投毒必须知道目标的链路本地地址，而 IPv4 侧只有 IP 与 MAC。两条路：
-
-1. **被动嗅探**（`sniff_llas`）：只读不发，收 `fe80::` 源地址
-2. **mDNS 主动询问**（`mdns_probe`）：带 QU 位要求单播回应
-
-> **实机踩坑**：写 `qclass=0x8001` 会被 scapy 的 `BitField` 拆成
-> `qclass(15 bit) + unicastresponse(1 bit)`，高位被吃掉，实际发出 `0x1`。
-> 对方于是按组播回，而本机未必收得到 —— 现象就是「发了查询却没人应答」。
-> 必须用 `unicastresponse=1`。
-
-**WiFi 托管模式的物理限制**：其他客户端之间的单播由 AP 转发、目的不是我们，
-网卡直接丢弃，因此被动嗅探只能看到广播/组播。设备休眠时两条路都探不到，
-此时降级为「仅v4」并如实标注，不假装成功。
-
----
-
-## 2.6 动效体系与图标（v2.2.0 新增）
-
-### 调度器：ui.Anim
-
-Tk 动画最经典的死法是：窗口销毁后 `after` 回调继续触发，抛
-`invalid command name` 的 TclError，且异常被 Tk 吞掉，表现为静默错乱。
-
-`ui.Anim` 把所有 `after` id 集中登记，窗口销毁时 `cancel_all()` 一把取消；
-回调内部再用 `self._destroyed` 双保险。列表上限 300，超限时裁掉已触发的旧 id。
-
-### 十类动效
-
-| 动效 | 位置 | 实现 | 帧率控制 |
-|---|---|---|---|
-| 窗口淡入 | 启动 | `attributes("-alpha")` 步进 | 16ms |
-| 横幅滑入 | 状态条内容变化时 | 先按 `dy=-10` 画好，再逐帧 `canvas.move` 回原位 | 仅内容变化时播一次 |
-| 行错峰淡入 | 扫描结果落地 | `_render_rows(animate=True)` 逐行 `after(n*26)` 插入 | ≤24 行才启用 |
-| 阻断行呼吸 | 有阻断目标时 | 70ms 改一次 `tag_configure("blocked", background=…)` | 单点更新，极廉价 |
-| 页脚数字滚动 | 设备数变化 | ease_out 插值，12 帧改文本 | 24ms |
-| 徽章弹跳 | 页脚数值变化 | 上移 3px → 分两步落回 | 触发式 |
-| 按钮波纹 + hover 光晕 | 鼠标交互 | 波纹：扩散圆环，颜色向底色混合模拟淡出；光晕：按钮外两圈浅色描边 | 触发式 |
-| 按钮流光 | 彩色按钮按下 | `CanvasButton._sheen()`：一道垂直高光带自左向右扫过并渐隐 | 触发式 |
-| 标题强调线 | 首次渲染 | "WiFiKill" 下灰绿线从 0 生长到全宽（`_title_grown` 保证只播一次） | 22ms |
-| 日志滚动高亮 | 每次写入 | 最新一条 `tag_add("fresh")` 浅绿底，620ms 后清除 | 触发式 |
-
-外加常驻的：状态点呼吸 + 扩散光晕（`StatusDot`，40ms）与扫描流动条（`Shimmer`，24ms）。
-
-### 性能约定
-
-- Tkinter 没有 alpha 合成，「淡出」一律用**颜色向背景混合**模拟
-- 逐行动画只在行数 ≤ 24 时启用，超过直接同步插入，避免大网络下像卡顿
-- 所有动效回调第一步都检查 `self._destroyed`
-
-### 一个重要的接口约定
-
-`_render_rows(animate=False)` 默认同步插入。只有「扫描结果落地」这一处传
-`animate=True`——因为阻断后刷新、右键菜单、自检脚本都默认「渲染完即可选中」，
-异步插入会破坏这个约定。第一版没做这个区分，28 项自检立刻红了 9 项，就是它。
-
-### 多尺寸图标
-
-托盘图标在 16px 下如果沿用大图绘制参数，缩完就是一团糊。`tools/make_icon.py`
-按尺寸分级绘制：
-
-| 尺寸 | 元素 |
-|---|---|
-| ≤ 20px | 1 道弧 + 斜杠（粗笔画） |
-| 21–32px | 2 道弧 + 斜杠 |
-| > 32px | 3 道弧 + 圆点 + 斜杠 |
-
-生成 9 个尺寸（16–256）打进单个 ICO，托盘/标题栏/任务栏各取所需。
-
-### 2.7 本机主动防御（Guard）· v2.4.0 新增
-
-`core.Guard` 与「阻断」是两套独立机制：阻断是**主动攻击**他人，守护是**被动防御**本机。
-它只做一件事——持续保证「本地 ARP/NDP 缓存里，网关 IP/LLA 指向的是真实网关 MAC」。
-
-关键设计点（均经对抗性审查硬化）：
-
-- **基准建立** —— 优先用扫描得到的 `ni.gateway_mac`，再用一次实时 ARP 询问交叉验证。
-  若两者**不一致**（疑似缓存已被投毒），直接 **fail closed**：不启动、不发包、不把可疑 MAC 钉死。
-- **只发真实映射** —— 纠正包里 `ARP.hwsrc / NDP.lladdr` 永远是网关真实 MAC，绝不伪造第三方。
-- **L2 源用本机 MAC** —— 免费 ARP / NA 的以太网源地址是本机，而非网关，避免冒充网关触发交换机端口安全。
-- **IPv6 重宣告单播到本机** —— `eth_dst = 本机 MAC`，绝不发往组播/广播（与 `NdpBlocker._send` 的组播拒发同源）。
-- **去抖** —— 网关 MAC 连续 2 次检测为漂移（或缓存连续 2 次缺失）才动作，避免瞬时重协商
-  或 `arp_table` 偶发解析失败触发误广播。
-- **网络切换软重启** —— 每拍核对 `ni.gateway_ip`（GUI 每次扫描都会注入最新 ni）：网关 IP
-  变化即触发 `_rebaseline`。否则换 Wi-Fi/换路由器后，守护会拿着旧基准继续动作 ——
-  轻则在新网络广播不存在的映射，**重则把更换后的真实网关持续"纠正"回旧 MAC，导致本机断网**。
-- **重估（rebaseline）双源一致** —— 重估时的基准采纳比启动时更严格（`strict=True`）：
-  必须「扫描缓存有效 且 实时 ARP 可答 且 两者一致」才采纳新基准；实时询问失败或单源
-  证据一律 fail closed 暂停纠正。原因：实时询问本身可能被攻击者抢答，单源采纳等于自伤。
-- **纠正失效触发重估** —— 同一漂移连续纠正 3 次后仍在漂移，说明要么攻击者持续投毒、
-  要么基准已过时（路由器已更换），自动触发重估，避免无限拉锯。
-- **start() 防并发** —— stop() 后旧守护线程若尚未退出，start() 会先 join 等待；仍不退出
-  则拒绝本次启动，避免两个守护线程并发 `_tick` 重复发包。
-- **本机缓存自愈（D1，真机审查发现）** —— 广播免费 ARP / 单播 NA **不会回环到本机
-  协议栈**（网卡不上交自发自收帧），因此重宣告只能纠正*其他设备*的缓存；
-  本机自身被投毒的条目靠「`arp -d` 删除 → 重新解析（真实网关应答）」自愈。
-  `arp -d` 无需管理员（真机实测）；IPv6 的 netsh 删除需提权，打包 exe（UAC 管理员）可用，
-  权限不足时 best-effort 跳过。演练模式绝不触碰本机缓存。
-- **dry_run 友好** —— 演练模式下只记录、绝对不发包。
-- **生命周期** —— 随主窗口启动/扫描自愈（断网重连后自动恢复运行），退出时随 `_quit` 停止。
-
-状态通过 `Guard.status()` 暴露（active / 网关基准 / 异常计数 / 上次动作），GUI 页脚「守护中」徽章据此显示，
-检测到投毒时自动纠正并写日志告警。
-
-### 2.8 全网 ARP 哨兵（Sentinel）· v2.5.0 新增
-
-`core.Sentinel` 管「全楼名册」，与 Guard（管网关映射）分工：
-
-- **基线半自动**：首次 `feed_scan` 把扫描结果静默入册（`known=True`，视为现任住户，
-  避免"开门全楼告警"轰炸）；之后新 MAC 入册为 `known=False` 并产生 `new` 事件，
-  由用户 `claim()`（认领）或 `forget()`（移出，下次出现再告警）。
-- **事件流**：`events` 最近 200 条（`SENTINEL_MAX_EVENTS`），随基线落盘 `sentinel.json`
-  （原子写，损坏即按空基线重建）。
-- **通知去重**：`_notify_dedup(key)` 同一事件 key 5 分钟内只弹一次
-  （`NOTIFY_DEDUP_SECONDS`），防持续攻击轰炸；`notify` 回调由 GUI 注入
-  （`TrayIcon.notify` 气泡），未注入只记 LOG —— 无头测试安全。
-- **投毒者指认**：Guard 漂移确认后 `_hunt_poisoner` 单飞启动 `sniff_poisoner`
-  （4 秒嗅探），抓「`psrc == 网关IP` 且 `hwsrc/eth.src ≠ 真实网关 MAC`」的帧，
-  取其以太网源 MAC。**指认结论必须带「疑似/可伪造」限定**——以太网源 MAC 可被
-  攻击者冒用无辜设备，不能写成定罪式断言（对抗性审查 F2）。
-
-### 2.9 占空比限速 · v2.6.0 新增
-
-ARP 层做不了真限速（NetCut 的限速依赖网关配合）。WiFiKill 的诚实做法是**占空比节流**：
-
-- `Target.duty`（10–100）：100 = 恒投毒（全断，默认）；`_should_poison(t, cycle_idx)`
-  在 10 拍周期（`_THROTTLE_CYCLE`）里阻断 `round(duty/10)` 拍，其余拍发**恢复帧**
-  让目标与网关的缓存回填（目标间歇可上网 = 体感限速）。
-- `set_duty` / `duty_of` API；`duty` 进 `asdict()` 随状态落盘，**崩溃恢复路径必须
-  读回 `it.get("duty")`**（gui `_restore_from_state`，对抗性审查 F1——漏读会让
-  限速目标重启后静默变回全断，与文档承诺矛盾）。
-- 边界：IPv6 侧不受 duty 影响（仍按 IPv6 阻断开关全断/放行）；恢复拍与阻断拍的
-  交替会让网络中 ARP 帧量比全断时多约一倍——这是设计代价，不是 bug。
-
----
+设备基线 `dict[mac -> {ip,name,known,first}]` + 事件流（上限 200 条），落盘 `sentinel.json`；
+首轮扫描静默入册，之后新 MAC 触发 `new` 事件与去重通知（同 key 5 分钟内一次）。
 
 ## 3. 关键数据结构
 
 ```python
 @dataclass
-class NetInfo:
-    iface: str          # \Device\NPF_{GUID}
-    my_ip: str
-    my_mac: str
-    gateway_ip: str
-    gateway_mac: str    # 空则拒绝阻断
-    cidr: str           # 192.168.1.0/24（网络地址，不是主机地址）
-    iface_name: str     # WLAN · Intel(R) Wi-Fi 6E AX211 160MHz
-
+class NetInfo:      # iface / my_ip / my_mac / gateway_ip / gateway_mac / cidr / iface_name
 @dataclass
-class Device:
-    ip, mac, vendor, dtype, note, state
-
+class Device:       # ip / mac / vendor / dtype / note / state
 @dataclass
-class Target:           # 阻断会话里的最小单位
-    ip: str
-    mac: str
+class Target:       # ip / mac / note / duty(10-100)
+@dataclass
+class V6Env:        # supported / gw_lla / gw_mac / my_lla / my_globals / prefixes
 ```
 
-`NetInfo.cidr` 必须是**网络地址**：`192.168.1.3/24` 这种写法 scapy 虽能解析，
-但会让 `same_subnet()` 与日志产生歧义，因此 `get_netinfo()` 会做 `ip & mask` 归一化。
+状态文件（`<exe 目录>/.wifikill-state.json`）：
 
----
+```json
+{
+  "updated": 1762012345.6,
+  "iface": "\\\\Device\\\\NPF_{...}",
+  "my_mac": "8c:e9:ee:a0:f3:b6",
+  "gateway_ip": "192.168.1.1",
+  "gateway_mac": "f8:79:28:cc:fc:e8",
+  "targets": [{"ip": "192.168.1.5", "mac": "e6:ff:70:f3:de:66", "note": "", "duty": 100}]
+}
+```
+
+解析一律走 `core.state_targets(data)`：非法条目跳过并记日志，`duty` 夹到 10–100，
+坏记录不会掀翻整条恢复链（第 5 轮真实缺陷）。
 
 ## 4. 报文结构
 
 ### 4.1 为什么 ARP 能被伪造
 
-ARP（RFC 826）设计于 1982 年，用于把 IP 解析为 MAC。它有两条致命特性：
+ARP 应答没有认证也没有序列号：任何主机都能宣称「某 IP 在某个 MAC 上」，接收方只看谁先到、
+就更新缓存。这正是本工具「双向投毒」的基础，也是 Guard 存在的理由。
 
-1. **无认证**：任何主机都能发送 ARP 应答，接收方不校验发送者身份
-2. **无条件覆盖**：收到应答就更新本地缓存，旧记录直接被替换
+### 4.2 双向投毒的两帧（IPv4）
 
-因此只要发出格式合法的 ARP 应答，就能改写对端缓存。
-
-### 4.2 双向投毒的两帧
-
-设：本机 `192.168.1.3 / 8c:e9:ee:a0:f3:b6`，
-网关 `192.168.1.1 / f8:79:28:cc:fc:e8`，
-目标 `192.168.1.5 / e6:ff:70:f3:de:66`。
-
-**帧 A — 欺骗目标**（让它以为网关在我这）：
-
-```
-以太头  dst=e6:ff:70:f3:de:66  src=8c:e9:ee:a0:f3:b6  type=0x0806
-ARP     htype=1 ptype=0x0800 hlen=6 plen=4 op=2(Reply)
-        sha =8c:e9:ee:a0:f3:b6   ← 本机 MAC
-        spa =192.168.1.1         ← 冒充网关 IP
-        tha =e6:ff:70:f3:de:66
-        tpa =192.168.1.5
+```python
+# 骗目标：网关 IP 的 MAC 是我（攻击方）
+Ether(dst=target.mac) / ARP(op=2, hwsrc=gw_mac, psrc=gw_ip, hwdst=target.mac, pdst=target.ip)
+# 骗网关：目标的 MAC 是我（攻击方）
+Ether(dst=gw_mac) / ARP(op=2, hwsrc=my_mac, psrc=target.ip, hwdst=gw_mac, pdst=gw_ip)
 ```
 
-**帧 B — 欺骗网关**（让它以为目标在我这）：
+恢复帧把 `hwsrc` 换成真实方（`restore=True`）：给目标的是**网关真实 MAC**，给网关的是**目标真实 MAC**。
+每帧 `sendp(..., count=N)` 连发多次抵消丢包（投毒 3 次，恢复 5 次）。
 
+### 4.3 为什么必须重发
+
+目标与网关都会刷新 ARP 缓存（Windows 邻居表有可达性状态机），单次投毒会在十几秒到几分钟内
+被真实应答覆盖。因此按 `interval`（0.5–10 秒）持续重发，直到停止会话或断开。
+
+### 4.4 IPv6 / NDP 报文
+
+NA（邻居通告）86 字节、`type=136`、`O=1`（允许覆盖缓存）、`S=0`（定向投毒用），
+携带目标地址与链路层地址选项：
+
+```python
+build_na(eth_src, eth_dst, ipv6_src, ipv6_dst, tgt=gw_lla, lladdr=my_mac)
 ```
-以太头  dst=f8:79:28:cc:fc:e8  src=8c:e9:ee:a0:f3:b6  type=0x0806
-ARP     op=2  sha=8c:e9:ee:a0:f3:b6  spa=192.168.1.5  tpa=192.168.1.1
-```
 
-两帧合计 42 字节（14 以太头 + 28 ARP），无填充。实测字节：
-
-```
-帧A  e6ff70f3de66 8ce9eea0f3b6 0806 0001 0800 06 04 0002
-     8ce9eea0f3b6 c0a80101 e6ff70f3de66 c0a80105
-帧B  f87928ccfce8 8ce9eea0f3b6 0806 0001 0800 06 04 0002
-     8ce9eea0f3b6 c0a80105 f87928ccfce8 c0a80101
-```
-
-> `c0a80101` = 192.168.1.1，`c0a80105` = 192.168.1.5。这两串是 `_poison_frames()`
-> 的单元测试断言依据。
-
-### 4.3 为什么不开转发
-
-ARP 投毒有两种用法：
-
-| 模式 | 转发 | 效果 |
-|---|---|---|
-| 中间人 | 开（`ip_forward` / Npcap 转发） | 能嗅探改包，目标不断网 |
-| **阻断** | **关** | 包到本机即丢弃，双向黑洞 |
-
-WiFiKill 只做后者：`Killer` 不碰任何转发设置，Windows 默认也不转发。
-
-### 4.4 为什么必须重发
-
-ARP 缓存有超时（Windows 约 15–45 秒，Linux 约 30 秒，部分设备 60 秒），
-且设备随时可能主动重发 ARP 请求覆盖。默认 1.5 秒一次的间隔足以压住绝大多数设备。
-
-### 4.5 为什么不受 WPA3 / PMF 影响
-
-802.11w（PMF）保护的是**管理帧**（deauth / disassoc），用于防止空口踢人。
-ARP 属于**数据帧**，在关联并完成 4 次握手之后才产生，此时链路层已被 WPA3 加密保护——
-但 ARP 欺骗是**在加密隧道内部**进行的，路由器会正常解密并转发这些伪造帧。
-
-所以：**PMF 挡的是 deauth 攻击，不挡 ARP 攻击。** 这是本项目选择 ARP 路线的核心理由。
-
----
+若目标发来 NS 询问网关，必须回一条 `S=1` 的 NA 代为应答，否则 NUD 会把缓存改回真实网关。
+`_send()` 是唯一出口，**拒绝任何组播/广播目的 MAC**（`ff02::1` 对应 `33:33:00:00:00:01`），
+防止误发把整网 IPv6 打掉。
 
 ## 5. 线程模型
 
-```
-Tk 主线程
-  ├── _drain()            每 80ms 排空 queue，执行跨线程回调
-  ├── 按钮回调            只做「派发线程 + 置 busy」，立即返回
-  └── 所有控件读写         仅在此线程
+| 线程 | 名称 | 周期 | 职责 |
+|---|---|---|---|
+| 投毒 | `wifikill-poison` | `interval` | 遍历队列，按 duty 决定发投毒帧或恢复帧 |
+| 守护 | `wifikill-guard` | 2.0s | 核对网关映射、漂移纠正、IPv6 重宣告（约 10s 一次） |
+| 嗅探 | `wifikill-hunt` | 事件触发 | 漂移后短嗅探 4s 定位投毒者（单飞，不堆积） |
+| IPv6 | `NdpBlocker` 内部线程 + `AsyncSniffer` | `interval` | 定向 NDP 投毒 + NS 代答 |
+| UI 工作线程 | 无名 daemon | 按操作 | 扫描、阻断、恢复、保存设置等耗时动作 |
+| 托盘 | `TrayIcon` 内部线程 | 消息循环 | `Shell_NotifyIcon` 消息泵 |
 
-工作线程（每次操作新建，daemon）
-  ├── core.scan()         可能 2–3 秒
-  ├── core.resolve_mac()  可能触发一次全段扫描
-  └── Killer.add/remove   单帧 sendp，毫秒级
+三条铁律：
 
-投毒线程（Killer 内部，常驻）
-  └── 每 interval 秒遍历 targets 发一轮
-```
+1. **UI 线程不阻塞**：所有发包/扫描在 worker 线程，结果经 `queue` 回主线程（`_post`）；
+2. **启动防并发**：`start()` 前先 `join()` 尚未退出的旧线程，仍不退出则拒绝本次启动；
+3. **日志线程安全**：`core.LOG.emit` 逐 sink try/except，一个订阅者坏掉不影响其他；
+   GUI 侧再经 `after_idle` 回投主线程。
 
-### 5.1 三条铁律
+### 5.1 关闭竞态
 
-1. **任何可能阻塞超过 50 ms 的调用都必须在工作线程**
-   —— 违反会导致窗口"未响应"白屏。
-   > 实际踩过：初版在 `do_block()` 里同步调用 `resolve_mac()`，点阻断会卡 2–3 秒。
+`stop()` 置 `Event` 并 `join(3s)`。若线程卡在 `sendp` 里没退出，`Killer.stop()` 会**明确告警**
+（恢复帧可能与最后一批投毒帧交叉）；`NdpBlocker` 同理，`stop(restore=True)` 会先停线程再回填。
 
-2. **工作线程绝不触碰控件**
-   —— 结果是 `self._post(lambda: ...)` 投递回主线程执行。
+### 5.2 工作线程与队列
 
-3. **日志也被视为控件操作**
-   —— `core.LOG.emit` 只入队，真正写 Text 控件发生在 `_drain` 里。
-
-### 5.2 关闭竞态
-
-初版关闭流程有个死锁：`on_close()` 置 `_closing=True` → `_drain()` 判断 `if not _closing` 后
-不再重排 → 恢复线程投递的 `destroy` 永远不执行 → 窗口关不掉。
-
-修法：改用独立的 `_destroyed` 标志，`_drain` 只在真正 destroy 之后才停止重排。
-
----
+`gui.py` 的 `_post(fn)` 把回调放入 `queue.Queue`，主线程 `after(70ms)` 轮询执行；
+任何 `_post` 的回调都在主线程，可直接改控件——这是 Tk 线程安全的唯一通道。
 
 ## 6. 阻断会话状态机
 
 ```
-        add(t)                stop()
-IDLE ──────────► ACTIVE ──────────► STOPPED
-  ▲                │  ▲                  │
-  │   remove(t)    │  │  start()         │ restore_all()
-  └────────────────┘  └──────────────────┘
+IDLE ──add()──► ARMED ──start()──► ACTIVE ⇄ (duty<100) THROTTLED
+                  ▲                    │
+                  └──自动离开──────────┘
+  ▲                                    │
+  └─────────remove() / restore_all() ◄─┘
 ```
 
-| 方法 | 前条件 | 副作用 |
+| 状态 | 判据 | 恢复手段 |
 |---|---|---|
-| `add(t)` | 网关 MAC 合法、目标 MAC 合法、二层可用 | 先构造帧验证 → 入队 → 立即发 3 次 → 落盘 |
-| `remove(ip)` | 目标存在 | 发 5 次恢复帧；**失败则把目标放回队列** |
-| `start()` | 未启动 | 起 daemon 线程，按 interval 发 |
-| `stop()` | —— | 置事件 + join(3s)，幂等 |
-| `restore_all()` | —— | stop → 逐条恢复 → 全成功才清状态文件 |
+| IDLE | 队列空、无状态文件 | — |
+| ARMED | 队列非空、线程未启动 | 启动线程或直接 `restore_all()` |
+| ACTIVE | 线程存活且未置停止位 | `remove()` / `restore_all()` / `abandon()` |
+| THROTTLED | 目标 `duty < 100` | 逐拍交替发投毒/恢复帧 |
 
-**"失败要放回"是刻意的**：如果恢复帧发不出去却清空了状态文件，用户会以为已放行，
-实际目标仍断网，且失去了"下次启动自动恢复"的机会——这是最坏的一种假成功。
-
----
+`persist()` 在**每次增删目标**时原子写状态文件；`dry_run` 时直接返回（绝不落盘）。
 
 ## 7. 状态持久化
 
-文件：`<exe 目录>/.wifikill-state.json`
+| 文件 | 用途 | 写入方 |
+|---|---|---|
+| `.wifikill-state.json` | 残留阻断状态（崩溃恢复用） | `Killer.persist()` / `core.write_state()` |
+| `whitelist.txt` | 白名单（IP/MAC 双键，一行一个） | `core.save_whitelist()` |
+| `aliases.json` | 设备备注（mac/ip → 名字） | `core.save_aliases()` |
+| `guard.json` | 守护开关 `{"enabled": bool}` | `core.set_guard_enabled()` |
+| `sentinel.json` | 哨兵基线 + 事件流（≤200 条） | `Sentinel.save()` |
 
-```json
-{
-  "updated": 1762012345.6,
-  "iface": "\\Device\\NPF_{...}",
-  "my_mac": "8c:e9:ee:a0:f3:b6",
-  "gateway_ip": "192.168.1.1",
-  "gateway_mac": "f8:79:28:cc:fc:e8",
-  "targets": [{"ip": "192.168.1.5", "mac": "e6:ff:70:f3:de:66", "note": ""}]
-}
-```
+统一约定：**原子写**（先写 `*.tmp` 再 `os.replace()`）、演练模式不落盘、空列表即删文件、
+写失败只记日志不抛给 GUI（状态写不进去不该把界面打崩）。
 
-规则：
+恢复流程：启动读状态 → `state_targets()` 解析 → 弹窗询问 → 用状态里的 MAC 发恢复帧 → 成功删文件。
+若网卡或网关 IP 与当前网络不一致，直接忽略并清除（旧网络的恢复帧只会发向失效 MAC）。
 
-- **原子写**：先写 `.tmp`，再 `os.replace()`，避免断电留下半个 JSON
-- **演练模式不落盘**：`persist()` 首行 `if self.dry_run: return`
-  > 这条是边界测试 `t_dryrun_no_state` 测出来的真实缺陷：初版演练模式也会写状态，
-  > 导致下次启动凭空出现"残留阻断"提示。
-- **空列表即删文件**：避免留下 `{"targets": []}` 这种噪音
-
-恢复流程：启动时读状态 → 有内容则弹窗询问 → 用户确认后用状态里的 MAC 发恢复帧 →
-成功则删文件。
-
----
+**状态与网络绑定（第 5 轮）**：`Killer` 持有创建时的 `NetInfo` 快照，换网后继续沿用会把帧发向
+旧网关 MAC——界面「阻断中」而目标照常上网。GUI 每次扫描后调用 `matches_network()` 比对，
+不一致即 `abandon()`，并**立刻摘掉旧对象**，确保下次阻断用新上下文重建。
 
 ## 8. 安全护栏的实现点
 
 | 护栏 | 实现位置 | 逻辑 |
 |---|---|---|
-| 网关保护 | `gui.do_block()` 过滤 **+ `core.Killer.add` API 层强制** | `core.is_protected(d)` 即 `d.note != "网关"`；**v2.3.1 起下沉到 `Killer.add`**，只要目标 IP 或 MAC 任一命中网关/本机即抛 `BlockError`，任何调用方都无法绕过 |
-| 本机保护 | 同上 | `core.is_protected(d)` 即 `d.note != "本机"`，且 `resolve_target()` 遇到本机 IP 直接返回本机 MAC |
-| 白名单 | `_state_of()` + `picks` 过滤（**单目标与全阻断两条路径**） | `ip in wl or mac in wl`（双键）；**v2.3.1 起单目标「阻断选中」同样过滤**，堵住单点绕过 |
+| 网关保护 | `gui.do_block()` 过滤 **+ `core.Killer.add` API 层强制** | 目标 IP 或 MAC 任一命中网关即抛 `BlockError` |
+| 本机保护 | 同上 | 目标 IP 或 MAC 任一命中本机即拒绝；`resolve_mac()` 遇本机 IP 直接返回本机 MAC |
+| 白名单 | `gui` 的 `_state_of()` + `picks` 过滤 | 单目标与全阻断两条路径都过滤（IP 或 MAC 命中即跳过） |
 | MAC 合法性 | `Killer._frames()` | 正则 `^([0-9a-f]{2}:){5}[0-9a-f]{2}$`，不合法抛 `BlockError` |
 | 网关 MAC 缺失 | `Killer._frames()` | 缺失即拒绝，绝不用空串构造 `Ether(dst="")` |
+| IPv6 受保护校验 | `NdpManager.add` + `NdpBlocker.preflight` | 结构化比对 IP/MAC/LLA，与 note 标注无关（防 API 直调绕过） |
+| 组播出口 | `NdpBlocker._send()` | 拒绝一切组播/广播目的 MAC |
+| 失控回滚 | `NdpBlocker._watchdog()` | 每 5 拍核对本机网关映射，被改坏立即停手并回填 |
+| 守护 fail closed | `Guard._establish_baseline()` | 缓存与实时询问分歧 / 不可达 → 不启动、不采纳 |
 | 单实例 | `core.SingleInstance` | 绑定 `127.0.0.1:51999`，失败即认为已有实例 |
-| 组播/广播出口 | `ipv6.NdpBlocker._send()` | 拒绝一切组播/广播目的 MAC，防止误发 `ff02::1` 切断整网 |
-
----
+| 换网中止 | `Killer.matches_network()` + `abandon()` | 防「界面阻断中、目标照常上网」的静默失效 |
 
 ## 9. 环境探测
 
-### 9.1 为什么不再以「管理员」作为硬门槛
-
-初版 `l2_check()` 在非管理员时直接返回 `no_admin`。实测发现这是**假阴性**：
-
-```
-管理员权限 否
-抓到的 ARP 应答总数 = 6，命中本机投毒特征 = 3
-判定： TX 链路真实可用 ✓
-```
-
-Npcap 安装时的选项决定了普通用户能否发帧。以 admin 作为门槛会让本来能用的机器被判定不可用。
-
-**现行策略**：`l2_check()` 只判断"确定不可用"的条件（scapy 缺失、Npcap 缺失），
-权限问题交给 `sendp()` 抛异常暴露，再由 UI 提示提权。
-
-### 9.2 网卡友好名
-
-`\Device\NPF_{GUID}` 对用户没有意义。scapy 的 `conf.ifaces` 提供三层信息：
-
-| 属性 | 值 |
-|---|---|
-| key / `network_name` | `\Device\NPF_{54D4581C-...}` |
-| `name` | `WLAN`（系统别名） |
-| `description` | `Intel(R) Wi-Fi 6E AX211 160MHz` |
-
-初版错误地用 `name` 去匹配 NPF 路径，永远匹配不上；正确做法是匹配 `network_name`。
-
-### 9.3 网段推导
-
-遍历 `conf.route.routes`，找出与 `my_ip` 同接口、掩码最长的路由（跳过 `/31`、`/32` 主机路由），
-用 `ip & mask` 归一化为网络地址。Windows 路由表里同时存在 `/24` 与 `/32` 两条，
-不跳过 `/32` 会算成 `192.168.1.3/32`。
-
----
+- **二层可用性**（`l2_check`）：只判定「确定不能工作」的条件（scapy 缺失 / Npcap 未装），
+  **不把管理员当作硬门槛**——Npcap 权限因安装选项而异，真实权限不足会在 `sendp` 时暴露；
+- **网段推导**（`get_netinfo`）：从 `conf.route.routes` 里挑与本机同网、掩码最长的一条；
+  只有 `/128` 主机路由时不算前缀（避免误判双栈）；
+- **网卡友好名**：`\Device\NPF_{GUID}` → 「别名 · 描述」；
+- **IPv6 环境**：`conf.route6.route("::")` 取默认网关 LLA，`route6.routes` 取全局前缀。
 
 ## 10. 异常处理约定
 
-| 异常 | 处理 |
+| 场景 | 行为 |
 |---|---|
-| `BlockError` | 业务级失败，UI 弹窗或日志 warn |
-| `sendp` 底层异常 | 包装成 `BlockError("发送失败：...")` |
-| 状态文件损坏 | `load_state()` 吞掉并返回 `{}`，不阻止启动 |
-| 日志回调抛错 | `Logger.emit` 逐 sink try/except，一个订阅者坏掉不影响其他 |
-| 启动期未捕获异常 | `main()` 兜底弹窗（`--windowed` 下没有控制台，否则用户只看到闪退） |
-
----
+| `BlockError`（业务失败） | UI 弹窗或日志 warn；调用方可见 |
+| `sendp` 底层异常 | 包装成 `BlockError("发送失败：...")`，并回滚队列 |
+| 状态文件损坏 | `load_state()` 吞掉并返回 `{}`；逐条解析时跳过坏记录 |
+| 哨兵基线损坏 | 按空基线重建并记日志（不再每次扫描抛异常） |
+| 日志订阅者抛错 | `Logger.emit` 逐 sink try/except |
+| 工作线程异常 | 恢复流程整体包裹并写日志；启动期异常由 `main()` 兜底弹窗 |
 
 ## 11. 测试体系
 
-三层，全部可重复执行。
+### 11.1 五套无头测试（148 项，CI 可跑）
 
-### 11.1 边界测试 `tests/test_edge.py`（34 项）
+| 套件 | 项数 | 覆盖 |
+|---|---|---|
+| `tests/test_edge.py` | 52 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5 轮回归 |
+| `tests/test_ipv6.py` | 58 | 报文级：NA 结构、组播保险、preflight、mDNS、邻居表解析 |
+| `tests/test_guard.py` | 21 | 守护：基准建立/重估/去抖/自愈/演练纯净 |
+| `tests/test_sentinel.py` | 11 | 哨兵：基线、告警、去重、认领/移出、事件上限、损坏自愈 |
+| `tests/test_throttle.py` | 6 | 占空比：档位、钳制、持久化、真循环交替 |
 
-不碰真实设备，全部用 `dry_run` 或伪造目标：
+### 11.2 真机 GUI 端到端（`selftest.py`，51 项）
 
-| 用例 | 断言 |
-|---|---|
-| `t_corrupt_state` | 损坏 JSON 不抛异常，返回 `{}` |
-| `t_bad_mac` | 非法 MAC 抛 `BlockError` 且不污染队列 |
-| `t_no_gateway_mac` | 网关 MAC 缺失必须拒绝 |
-| `t_idempotent` | 重复 add 保持单条记录 |
-| `t_concurrent` | 8 线程 × 20 轮 add/remove 无异常 |
-| `t_dryrun_no_state` | 演练模式不写状态文件 |
-| `t_single_instance` | 第二个实例被拒绝 |
-| `t_bad_cidr` | 非法网段扫描不崩 |
-| `t_whitelist_mac` | 白名单可只有 MAC，且自动小写 |
-| `t_restore_clears` | 恢复后队列清空、计数正确 |
-| `t_stop_is_clean` | stop 后线程退出、可重复调用 |
-| `t_logger_isolation` | 日志回调抛错被隔离 |
-| `t_protected_device` | 网关/本机被标记受保护、普通设备不受保护、单目标过滤只留普通设备、仅选网关无可阻断目标（v2.3.0 新增） |
+启动**真实窗口**、走真实扫描，注入一台「幽灵设备」（`02:00:00:00:00:01`，全网不存在）后执行
+阻断/限速/放行/守护演练/哨兵面板/换网中止等全链路断言，并逐步截图。
+开头会备份并清空运行时状态文件（否则上一轮残留会让结果取决于「上次跑到哪一步」），结束时恢复。
 
-### 11.2 IPv6 报文级 `tests/test_ipv6.py`（58 项）
+### 11.3 对抗性审查与探针
 
-不碰网卡、不发一个包 —— CI（ubuntu-latest，无 Npcap）也能跑：
+每一轮审查的缺陷都先写成**可复现探针**（临时脚本）看到红，再改代码到绿，最后把等价断言
+固化进上面三套测试。第 5 轮探针覆盖：发送失败回滚、状态文件容错、哨兵基线自愈、换网中止、
+受保护设备四形态拒绝。
 
-| 组 | 断言 |
-|---|---|
-| 报文结构 | 86 字节、type=136、tgt 正确、O=1、S=0、携带 MAC 正确 |
-| 代理应答 | `build_ns_reply` 必须置 S=1 |
-| 回填帧 | 携带的是真实网关 MAC，不是本机 MAC |
-| 组播保险 | `ff02::1` / mDNS / 广播 / `01:00:5e:*` 四种目的地址全部被拒 |
-| preflight | 缺 IPv6 路由、缺网关 MAC、缺目标 LLA 三种情况都拒绝启动 |
-| mDNS 报文 | 4 个问题、QU 位为 1、`qclass=1`、目的地址与组播 MAC 正确 |
-| 邻居表解析 | 跳过 `00:00:00:00:00:00`、大小写不敏感、不存在返回 None |
-| 双栈判定 | 只有 `/128` 主机路由时不算双栈 |
-| MAC 校验 | 大小写、短写、非十六进制 |
+### 11.4 清单兜底
 
-### 11.3 GUI 自检 `selftest.py`（46 项）
+构建/发布前跑一次固定清单（编译、`core` 不含 tkinter、无环境变量、安全不变量、dry-run 纯净、
+状态容错、换网中止、版本一致、gitignore 覆盖、文档计数与实跑一致、`ui` 常量引用全部存在）。
+任何一条红即视为回归。
 
-开头会**备份并清空** `whitelist.txt` 与 `.wifikill-state.json`，结束时恢复——
-否则上一轮中断残留的文件会让断言结果取决于"上次跑到哪一步"。这是实测踩过的坑：
-一次空 `whitelist.txt` 让「行状态=阻断中」红了，排查半天发现是状态泄漏。
-
-启动真实窗口，注入一台 **`02:00:00:00:00:01` 幽灵设备**（全网不存在），
-对它执行阻断/放行，从而在不影响任何真人的前提下覆盖完整图形链路。
-
-覆盖：自动扫描、网关/本机识别、网卡友好名、状态栏、日志、阻断按钮启用态、
-Killer 建立、队列、投毒线程、状态文件落盘、行状态变色、放行按钮、
-白名单增删、设置窗口、恢复后状态复位、关闭流程。
-
-### 11.4 真机发包验证
-
-```python
-sn = AsyncSniffer(iface=ni.iface, lfilter=lambda p: p.haslayer(ARP) and p[ARP].op == 2)
-sn.start()
-for _ in range(3):
-    k._emit(ghost_target)      # ghost MAC 不存在，零影响
-pkts = sn.stop()
-hit = [p for p in pkts if p[ARP].psrc == ni.gateway_ip
-       and p[ARP].hwsrc.lower() == ni.my_mac.lower()]
-```
-
-实测结果：`命中本机投毒特征 = 3`，证明帧确实离开了网卡。
-
-### 11.5 真机端到端验证（v2.3.0，第二台在线设备）
-
-在网内存在**真实在线设备**（非网关、非本机）的条件下完成闭环：
-
-**IPv4 阻断 + 恢复**（目标：`192.168.1.5`，真实手机）：
-
-```
-targets after add     = ['192.168.1.5']
-is_active             = True
-state file exists     = True          # 崩溃恢复状态已落盘
-restore_all returned  = 1
-targets after restore = []
-state file after      = False         # 状态已清理
-ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅探捕获
-```
-
-说明：`0.6s` 间隔下约 2.2 秒，毒化线程每周期发 2 帧（目标 + 网关），
-`add` 时再连发 3 帧、`restore_all` 时连发 5 帧 —— 共 24 帧在线上被捕捉，
-证明双向投毒与恢复的真实报文都离开了网卡。
-
-**IPv6 路径**（同一网络存在全局 IPv6 `2409:8a55:.../64`）：
-
-| 检查 | 结果 |
-|---|---|
-| 网关 IPv6 LLA 可达 | `fe80::1 → f8:79:28:cc:fc:e8`（路由器） |
-| 组播 NA 安全闸 | **PASS**：发往 `33:33:00:00:00:01` 被 `BlockError` 拒绝，零上线 |
-| 真实单播 NA 上线 | `sent = 1`，嗅探捕获 1 帧 |
-| 设备 LLA 探明 | 两台手机处于 IPv6 静默，返回「未探明」（见 §13 已知限制） |
-
-> 诚实边界：两台在线设备均为 IPv6 静默（无邻居表项、不回应 mDNS），
-> 因此无法对其 LLA 做**端到端 IPv6 阻断**——这正是 §13 记录的已知限制，
-> 并非缺陷。IPv6 的报文构造、安全闸、单播上线与网关可达性均已真实验证。
-
-### 11.6 守护单元测试 `tests/test_guard.py`（21 项）
-
-不碰真实网络，网络层全部用 fake 注入，断言「只发真实网关映射、不冒充、有去抖、dry_run 不发包」：
-
-| 用例 | 断言 |
-|---|---|
-| `no_baseline_no_start` | 拿不到网关 MAC 时 start() 失败、不启线程 |
-| `reassert_sends_true_mapping` | 纠正包 ARP 层 `hwsrc/psrc` 是网关真实映射，L2 源是本机 MAC |
-| `tick_no_drift_no_send` | 缓存正常时绝不打扰网络 |
-| `tick_drift_detected_with_debounce` | 连续 2 次漂移才判定投毒并纠正（去抖） |
-| `dry_run_no_send` | 演练模式只记录、不发包 |
-| `v6_reassert_is_unicast_true_mapping` | IPv6 重宣告单播到本机、只发真实映射 |
-| `v6_dry_run_no_send` | IPv6 演练不发包 |
-| `start_stop_lifecycle` | 正常启停、线程受控 |
-| `baseline_disagreement_fail_closed` | 缓存与实时询问分歧时不启动（fail closed） |
-| `baseline_agreement_starts` | 一致时正常启动 |
-| `ndp_table_parse_windows` | 正确解析 `netsh` 输出得到网关 LLA→MAC |
-| `gateway_ip_change_rebaselines` | 网关 IP 变化 → 重建基准，一致才采纳，当拍不发包 |
-| `gateway_ip_change_fail_closed` | 换网络后新基准不可达 → 清空基准，绝不再发包 |
-| `rebaseline_adopts_new_mac_when_consistent` | 纠正失效触发重估，缓存+实时一致才采纳新 MAC |
-| `rebaseline_fail_closed_when_disagreement` | 重估时分歧 → 清空基准 fail closed，不新增发包 |
-| `cache_missing_debounce` | 缓存缺失与漂移共用去抖，连续 2 次才宣告；缺失不计投毒 |
-| `start_rejects_when_old_thread_alive` | stop 后旧线程未退出时 start 拒绝（防双线程并发） |
-| `refresh_v6_after_rebaseline` | 重估清空 _v6 后恢复一致上下文；env 与基准分歧时保持关闭 |
-| `drift_clears_local_arp` | 漂移纠正时同步 `arp -d` 删除本机脏条目（广播帧不回环本机栈） |
-| `dry_run_skips_local_arp_clear` | 演练模式绝不动本机真实缓存 |
-| `v6_drift_clears_local_neighbor` | IPv6 漂移时 best-effort 删除本机邻居条目（netsh 需提权） |
-
-### 11.7 哨兵单元测试 `tests/test_sentinel.py`（10 项）
-
-| 用例 | 断言 |
-|---|---|
-| `first_run_silent_baseline` | 首次运行全楼静默入册，不告警 |
-| `new_device_alerts` | 新 MAC 出现 → new 事件 + 通知 + 待认领 |
-| `notify_dedup_5min` | 同事件 key 5 分钟内只弹一次 |
-| `claim_and_forget` | 认领闭环；移出后重新告警 |
-| `persistence` | 基线与事件落盘，新实例恢复 |
-| `events_cap` | 事件流 200 条截断 |
-| `sniff_poisoner_finds_attacker` | 嗅探过滤逻辑：冒称帧入选、真网关/无关 IP 排除 |
-| `sniff_poisoner_empty_when_clean` | 抓不到如实返回空 |
-| `guard_hunt_reports_poisoner` | 漂移触发指认，事件经 event_sink 含去重 key |
-| `guard_hunt_dry_run_silent` | 演练模式不嗅探 |
-
-### 11.8 占空比限速单元测试 `tests/test_throttle.py`（6 项）
-
-| 用例 | 断言 |
-|---|---|
-| `duty_100_always_poisons` | duty=100 恒阻断 |
-| `duty_50_half_and_half` | duty=50 十拍五断五通，且阻断/恢复拍各自连续 |
-| `duty_10_one_in_ten` | duty=10 周期内 1 拍阻断 |
-| `duty_clamped` | <10 与 >100 钳制 |
-| `set_duty_updates_and_persists` | 更新 + 触发持久化（state 含 duty） |
-| `loop_alternates_poison_and_restore` | 真循环集成：阻断拍与恢复拍交替出现 |
-
----
-
-## 12. 打包与版本管理
+## 12. 打包与发布
 
 ### 12.1 版本真源
 
-`versions.json`：
+`versions.json` 是唯一真源：
 
 ```json
-{"app": "2.0.0", "user_manual": "1.0.0", "tech_manual": "1.0.0", "build": 1, "released": "2026-11-02"}
+{"app": "2.6.2", "user_manual": "1.6.2", "tech_manual": "1.6.2", "build": 12, "released": "2026-11-02"}
 ```
 
-### 12.2 构建流程
+### 12.2 构建流程（`build.py`）
 
-```
-python build.py
-  ├─ 1. app / user_manual / tech_manual 各 +1 patch，build +1，写回 json
-  ├─ 2. 正则替换两份手册的「文档版本」「对应程序」标记
-  ├─ 3. 生成 build/version_info.txt（Windows 文件版本资源）
-  ├─ 4. PyInstaller --onefile --windowed --version-file ... gui.py
-  ├─ 5. PyInstaller 出 dist/WiFiKill.exe
-  ├─ 6. 复制为 dist/WiFiKill-vX.Y.Z.exe（单文件版）
-  ├─ 7. ISCC 编译 installer/WiFiKill.iss → dist/WiFiKill-vX.Y.Z-setup.exe（安装版）
-  └─ 8. 打 dist/WiFiKill-vX.Y.Z-portable.zip（exe + README + 两份手册 + LICENSE，打包版）
+```bash
+python build.py --bump patch    # 默认：修复/文档
+python build.py --bump minor    # 新功能
+python build.py --no-bump       # 用当前版本重打（调试）
+python build.py --zip-only      # 只重打 zip
 ```
 
-文档里的标记行格式固定，构建脚本靠正则定位：
+1. 递增 `app`；`user_manual` / `tech_manual` 跟随（minor 及以上升 minor，否则升 patch）；`build` +1；
+2. **同步文档版本**：两份手册头部（`文档版本` / `对应程序`）、README 的版本徽章、版本表、手册行；
+3. **校验文档版本**（`build.py:verify_doc_versions()`）：上述标记若与 `versions.json` 不一致，
+   **直接中止构建**——防止格式漂移导致
+   版本号静默不同步、发布物带旧版本出厂（第 6 轮真实缺陷）；
+4. 写 exe 版本资源 → PyInstaller 单文件打包 → 出三个产物：
+   `WiFiKill-vX.Y.Z.exe`（单文件）、`WiFiKill-vX.Y.Z-setup.exe`（安装版）、
+   `WiFiKill-vX.Y.Z-portable.zip`（exe + README + 两份手册 + 概念图 + 许可）。
 
-```markdown
-> 文档版本：**v1.6.1** · 对应程序：**v2.6.1** · 更新日期：2026-11-02
-```
+### 12.3 安装包（`installer/WiFiKill.iss`）
 
-### 12.3 打包参数与取舍
+- 构建时传入 `/DAppVersion=x.y.z`，输出到 `dist/`；
+- **`LicenseFile=DISCLAIMER.txt`**：向导第一步展示中文免责声明，必须勾选同意；
+- 安装内容：exe、README、两份手册、`docs/images/`（README 引用概念图，缺图会裂）、许可；
+- 卸载时清理 `.wifikill-state.json`、`whitelist.txt`、`aliases.json`、`guard.json`、`sentinel.json`。
 
-| 参数 | 理由 |
-|---|---|
-| `--onefile` | 用户要"一个 exe" |
-| `--windowed` | 不要黑框；代价是 `stdout=None`，故 core 禁止 print |
-| `--collect-submodules scapy` + `--collect-data scapy` | scapy 有大量动态导入与数据库文件 |
-| `--exclude-module numpy/matplotlib/pandas/PIL/setuptools/test` | 剔掉后 45 MB → 16.8 MB，启动 8.9 s → 2.3 s |
-| `--version-file` | exe 属性里能看到版本号 |
-| 干净 venv 构建 | 系统 Python 的 site-packages 太杂，模块图分析从 42 s 降到 ~45 s 且更可控 |
+### 12.4 Release 流水线（`.github/workflows/release.yml`）
 
-> 注：tkinter **不能**排除，它是 UI 本体。排除 PIL 只影响 `tools/make_images.py` 与 `selftest.py`。
+推 tag `v*` 触发：
 
----
+1. **校验 tag 与 `versions.json` 一致**（不一致直接失败，防止产物名与 Release 标题错配）；
+2. 装 Python 3.12（python.org 官方包，自带 tkinter）+ scapy + pyinstaller + Inno Setup；
+3. 依次跑五套无头测试（任一失败即停）；
+4. `python build.py --no-bump` 构建三种产物；
+5. 发布 Release 并附上三种产物 + `README.md` + 两份手册，正文由 workflow 内的模板生成
+   （含功能、验证数字与免责声明）。
 
-## 12.5 托盘实现要点
-
-不引入 pystray 的原因：它依赖 Pillow，会把打包体积从 16.9 MB 拉到 20 MB+。
-
-自实现路径：
-
-```
-独立守护线程
-  ├── RegisterClassExW 注册窗口类
-  ├── CreateWindowExW 建不可见窗口
-  ├── Shell_NotifyIconW(NIM_ADD) 挂图标
-  └── GetMessageW / DispatchMessageW 消息循环
-```
-
-WndProc 处理三类消息：
-
-| 消息 | 动作 |
-|---|---|
-| `WM_TRAY`（自定义 `WM_APP+1`） | 左键双击→显示主界面；右键→弹 `TrackPopupMenu` |
-| `TaskbarCreated` | 资源管理器重启后重新挂图标 |
-| `WM_CLOSE` | `NIM_DELETE` + `DestroyWindow`，干净退出 |
-
-**踩过的坑**：ctypes 不给函数声明 `argtypes` 时会把指针当 32 位 int，
-64 位下 `DefWindowProcW` 直接抛 `OverflowError: int too long to convert`，
-且异常被 ctypes 吞成 "Exception ignored"，表现为托盘静默不出现。
-修法是把 `DefWindowProcW`、`CreateWindowExW`、`LoadImageW` 等全部显式声明签名。
+> 真机 `selftest.py` 需要真实窗口与网卡，**不进 CI**，由本地发布前手工执行。
 
 ## 13. 已知限制
 
-| 限制 | 原因 | 是否可解 |
-|---|---|---|
-| 客户端隔离网络无效 | AP 不转发站间流量，拿不到目标 MAC | 不可解，这是网络策略 |
-| 静态 ARP 绑定的设备不受影响 | 对端不更新缓存 | 不可解 |
-| 目标装了 ARP 防火墙 | 会校验并丢弃伪造应答 | 不可解 |
-| IPv6 只断经网关的出站 | 只投毒默认路由的邻居项，同链路直连不经网关 | 不可解 |
-| IPv6 目标地址依赖设备活跃 | 托管模式看不到他人单播，只能靠 mDNS/组播 | 部分可解（有线 + 端口镜像） |
-| IPv6 同时只能断 1 台 | 刻意限制，降低整网失控风险 | 刻意为之 |
-| 不支持 5GHz 特有行为 | 工作在二层之上，无频段概念 | 无影响 |
-| 单文件启动约 2.3 s | PyInstaller 解包 | 可改 `--onedir`，但会变成文件夹 |
-
----
+1. **ARP 层做不了真限速**：占空比只是节流，依赖目标侧的缓存刷新行为；
+2. **IPv6 只断经网关出站**：同链路直连不受影响；LLA 探明失败时只能降级为「仅 IPv4」；
+3. **投毒线程 join 超时的交叉窗口**：恢复帧可能与最后一批投毒帧交叉，程序会告警但未做发送序号排序；
+4. **换网判定依赖扫描**：某次扫描探测为空时不判换网（避免误杀生效中的阻断），旧上下文会保留到
+   下一次能判定的扫描；
+5. **嗅探定位非定罪**：以太网源 MAC 可被冒用，指认结论始终标注「疑似」；
+6. **客户端隔离无法绕过**：路由器开了 AP Isolation 就看不到其他设备；
+7. 非 Windows 分支未验证。
 
 ## 14. 扩展点
 
-| 想做的事 | 改动位置 |
-|---|---|
-| 支持 IPv6（NDP 欺骗） | `core.Killer._frames()` 增加 ICMPv6 NA 帧 |
-| 增加带宽限速而非全阻断 | 需开启转发 + 令牌桶，改动较大 |
-| 定时策略（晚上自动阻断） | `gui` 加 `after` 定时器调用 `do_block` |
-| 托盘常驻 | 引入 `pystray`，改写 `gui.main` |
-| 设备备注持久化 | 状态文件加 `notes` 字段，`Device.note` 已有位置 |
-
----
+- **新阻断手段**：`Killer._frames()` 之外再实现一个会话类，复用 `matches_network()` 与受保护校验；
+- **新防御策略**：`Guard` 的 `event_sink` 已解耦（GUI 注入 `Sentinel.feed_event`）；
+- **新 UI**：`core` 不依赖 tkinter，可直接被 CLI / 服务包装；
+- **新测试**：五套测试都是纯脚本（`sys.exit(1 if FAIL)`），新增套件只需在 CI 里加一步。
 
 ## 15. 附：一次真实运行的环境探测输出
 
 ```
-Python        3.13.14 / 3.12.4
-scapy         2.8.0
-管理员权限    否
-二层收发      可用
-网卡          WLAN · Intel(R) Wi-Fi 6E AX211 160MHz
-本机          192.168.1.3  (8c:e9:ee:a0:f3:b6)
-网关          192.168.1.1  (f8:79:28:cc:fc:e8)
-网段          192.168.1.0/24
+Python      3.12.4
+scapy       2.8.0
+管理员权限  否
+二层收发    可用
+网卡        WLAN · Intel(R) Wi-Fi 6 AX201 160MHz
+本机        192.168.1.250  8c:e9:ee:a0:f3:b6
+网关        192.168.1.1    f8:79:28:cc:fc:e8
+网段        192.168.1.0/24
 ```
 
-扫描合并结果（主动 2 台 + 缓存 3 台 = 5 台，验证了"两路合并"策略的必要性）：
+（以上输出由「环境自检」按钮生成；`selftest.py` 全部断言均在同类真机环境下执行通过。）
 
-```
-192.168.1.1   f8:79:28:cc:fc:e8   —          网关
-192.168.1.2   ee:89:6d:6f:b4:54   随机 MAC    移动设备?
-192.168.1.3   8c:e9:ee:a0:f3:b6   —          本机
-192.168.1.4   4e:55:a0:5f:47:20   随机 MAC    移动设备?
-192.168.1.5   e6:ff:70:f3:de:66   随机 MAC    移动设备?
-```
+---
 
-其中 `.2 / .4 / .5` 的第二字节 `0x89 / 0x55 / 0xff` 均带 locally-administered 位
-（`& 0x02`），被正确识别为随机化 MAC。
+> **免责声明**：本项目仅用于自有网络或已获书面授权的安全测试、教学演示与研究。
+> 未经授权干扰他人网络通信可能违反《网络安全法》第二十七条、《治安管理处罚法》第二十九条；
+> 情节严重可触犯《刑法》第二百八十五条、第二百八十六条。**作者不对任何滥用行为承担责任。**

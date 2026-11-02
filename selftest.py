@@ -13,6 +13,7 @@ selftest.py — GUI 全功能自检（真机执行，不触碰真实设备）
 import ctypes
 import ctypes.wintypes as wt
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -271,15 +272,90 @@ def run():
             app._sentinel.feed_event("info", "自检：事件流写入验证")
             check("哨兵事件流可写入", len(app._sentinel.events) >= 1
                   and app._sentinel.events[-1]["kind"] == "info")
+            for w in list(app.winfo_children()):     # 先清遗留窗口，避免判定受上一轮干扰
+                if isinstance(w, gui.tk.Toplevel):
+                    w.destroy()
+            app.update()
+            before = [w for w in app.winfo_children() if isinstance(w, gui.tk.Toplevel)]
             app._open_sentinel()               # 面板可打开
             app.update()
-            check("哨兵面板可打开", any(isinstance(w, gui.tk.Toplevel)
-                                        for w in app.winfo_children()))
+            after = [w for w in app.winfo_children() if isinstance(w, gui.tk.Toplevel)]
+            check("哨兵面板可打开", len(after) == len(before) + 1,
+                  f"打开前 {len(before)} / 打开后 {len(after)}")
             for w in list(app.winfo_children()):
                 if isinstance(w, gui.tk.Toplevel):
                     w.destroy()
         except Exception:
             check("s6c", False, traceback.format_exc()[-300:])
+
+    # 6.9 第 5 轮回归：IPv6 阻断的可见性 / 哨兵面板不截断 / 网络变更中止
+    def s6d():
+        try:
+            # ① 只剩 IPv6 目标时，「全部放行」必须可用（此前按钮被判死）
+            class _FakeV6:
+                def __init__(self):
+                    self.calls = 0
+                def active_ips(self):
+                    return ["192.168.1.251"]
+                def state_of(self, ip):
+                    return ""
+                def restore_all(self, restore=True):
+                    self.calls += 1
+                    return 1
+                def remove(self, ip, restore=True):
+                    return 0
+
+            real_mgr = app._ndp_mgr
+            fake = _FakeV6()
+            app._ndp_mgr = fake
+            app._update_buttons()
+            check("仅有 IPv6 阻断时「全部放行」可用", app.btn_free.enabled)
+            app._ndp_mgr = real_mgr
+            app._update_buttons()
+
+            # ② 哨兵面板列出全部待认领：8 台都要在，不能被 pending[:6] 截断
+            for i in range(8):
+                mac = f"02:00:00:00:{i + 1:02x}:01"
+                app._sentinel._known[mac] = {"ip": f"192.168.1.{200 + i}", "name": "",
+                                             "known": False, "first": 0}
+            app._open_sentinel()
+            app.update()
+            tv, n = None, -1
+            for w in app.winfo_children():
+                if not isinstance(w, gui.tk.Toplevel):
+                    continue
+                for frame in w.winfo_children():
+                    for c in frame.winfo_children():
+                        try:
+                            cols = [str(x) for x in c["columns"]]
+                        except Exception:
+                            continue
+                        if isinstance(c, gui.ttk.Treeview) and cols == ["ip", "mac", "first"]:
+                            tv, n = c, len(c.get_children())
+            check("哨兵面板列出全部待认领(8 台)", n == 8, f"实际 {n} 台")
+            for w in list(app.winfo_children()):
+                if isinstance(w, gui.tk.Toplevel):
+                    w.destroy()
+
+            # ③ 网络变更：旧阻断必须中止，状态文件不能留着下次误恢复
+            k = core.Killer(app._net, dry_run=True)
+            k.add(core.Target("192.168.1.250", "02:00:00:00:00:01"))
+            k.persist()
+            app._killer = k
+            other = core.NetInfo(**{**app._net.__dict__,
+                                    "gateway_ip": "10.9.9.1",
+                                    "gateway_mac": "02:00:00:00:00:99"})
+            app._apply_scan(other, app._devices, True)
+            for _ in range(80):        # 清理走后台线程，轮询等它收敛（不靠固定延时赌时序）
+                app.update()
+                if not k.targets() and not core.STATE_FILE.exists():
+                    break
+                time.sleep(0.05)
+            check("网络变更后旧阻断被中止", not k.targets(), str([t.ip for t in k.targets()]))
+            check("网络变更后状态文件被清除", not core.STATE_FILE.exists())
+            check("网络变更后旧上下文被摘除(下次阻断会重建)", app._killer is None)
+        except Exception:
+            check("s6d", False, traceback.format_exc()[-300:])
 
     # 7. 退出
     def s7():
@@ -289,7 +365,7 @@ def run():
     wait_then(lambda: not app._busy and len(app._devices) > 0, lambda: (
         s1(), app.after(300, s2), app.after(2600, s3), app.after(3000, s4),
         app.after(3400, s5), app.after(3800, s6), app.after(4300, s6b),
-        app.after(4900, s6c), app.after(6200, s7)))
+        app.after(4900, s6c), app.after(5600, s6d), app.after(6800, s7)))
     app.mainloop()
     restore_state()
 

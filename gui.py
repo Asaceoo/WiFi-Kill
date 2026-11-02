@@ -602,7 +602,10 @@ class App(tk.Tk):
     def _update_buttons(self):
         idle = not self._busy
         has = bool(self.tree.selection())
-        blocked = bool(self._killer and self._killer.targets())
+        # IPv6 阻断也算「有阻断」：只看 v4 队列会让「全部放行」在只剩 v6 目标时
+        # 变成不可点的死按钮，用户除了退出程序没别的办法停它（对抗性审查第 5 轮）。
+        blocked = bool(self._killer and self._killer.targets()) \
+            or bool(self._ndp_mgr.active_ips())
         self.btn_scan.set_enabled(idle)
         self.btn_block.set_enabled(idle and has)
         self.btn_all.set_enabled(idle and bool(self._devices))
@@ -678,7 +681,7 @@ class App(tk.Tk):
         elif self._ndp_on and self._v6env is not None and self._v6env.dual_stack:
             self._banner_state = ("info",
                                   "IPv6 阻断已启用（实验）：只断经网关的出站，"
-                                  "同时仅支持 1 台目标")
+                                  "支持多目标并发（每目标独立护栏）")
             self._badge_dot.set(ui.OLIVE)
             self._status_text = "IPv6 已启用"
         elif not admin:
@@ -693,10 +696,15 @@ class App(tk.Tk):
 
     def _maybe_recover(self):
         st = core.load_state()
-        items = st.get("targets") or []
+        # 对抗性审查第 5 轮：解析下沉到 core.state_targets（非法条目跳过），
+        # 此前直接在 GUI 里 it["ip"]，状态文件缺字段会让整个恢复线程静默死掉。
+        items = core.state_targets(st)
         if not items:
+            if st.get("targets"):
+                core.clear_state()
+                self.log("残留阻断记录不合法（地址缺失或格式错误），已清除", "warn")
             return
-        names = "、".join(t["ip"] for t in items[:4])
+        names = "、".join(t.ip for t in items[:4])
         more = f" 等 {len(items)} 台" if len(items) > 4 else ""
         if messagebox.askyesno(
                 "发现残留阻断",
@@ -707,26 +715,52 @@ class App(tk.Tk):
 
     def _restore_from_state(self, items):
         def work():
-            ni = core.NetInfo(**self._net.__dict__)
-            st = core.load_state()
-            # 对抗性审查 R1：状态里的网关信息可能来自旧网络 —— 换网后按旧网关
-            # 构造恢复帧只会发向失效 MAC，救不回目标还可能误报成功。
-            # 接口或网关 IP 不一致时放弃恢复并清除残留记录。
-            if (st.get("iface") and st["iface"] != ni.iface) or \
-                    (st.get("gateway_ip") and st["gateway_ip"] != ni.gateway_ip):
-                self._post(lambda: self.log("残留阻断记录来自其他网络，已忽略并清除", "warn"))
-                core.clear_state()
-                return
-            k = core.Killer(ni, dry_run=False)
-            for it in items:
-                # 对抗性审查 F1：占空比随状态落盘（v2.6.0），恢复时必须带回来，
-                # 否则崩溃重启后限速目标会静默变回全断。
-                k._targets[it["ip"]] = core.Target(it["ip"], it["mac"],
-                                                   duty=int(it.get("duty", 100)))
-            n = k.restore_all()
-            self._post(lambda: self.log(f"已恢复 {n} 台设备", "ok"))
-            self._post(self.do_scan)
+            try:
+                ni = core.NetInfo(**self._net.__dict__)
+                st = core.load_state()
+                # 对抗性审查 R1：状态里的网关信息可能来自旧网络 —— 换网后按旧网关
+                # 构造恢复帧只会发向失效 MAC，救不回目标还可能误报成功。
+                # 接口或网关 IP 不一致时放弃恢复并清除残留记录。
+                if (st.get("iface") and st["iface"] != ni.iface) or \
+                        (st.get("gateway_ip") and st["gateway_ip"] != ni.gateway_ip):
+                    self._post(lambda: self.log("残留阻断记录来自其他网络，已忽略并清除", "warn"))
+                    core.clear_state()
+                    return
+                k = core.Killer(ni, dry_run=False)
+                for t in items:
+                    # 队列来自 core.state_targets()：地址已校验，duty 已夹取
+                    #（对抗性审查 F1：占空比必须随状态回来，否则崩溃重启后限速变全断）
+                    k._targets[t.ip] = t
+                n = k.restore_all()
+                if n == len(items):
+                    self._post(lambda: self.log(f"已恢复 {n} 台设备", "ok"))
+                else:
+                    self._post(lambda: self.log(
+                        f"仅恢复 {n}/{len(items)} 台，其余恢复帧未能发出"
+                        f"（可再点「全部放行」重试）", "warn"))
+            except Exception as e:
+                # 恢复线程异常必须让用户看见，不能只留 traceback。
+                self._post(lambda: self.log(f"残留阻断恢复失败：{e}", "err"))
+            finally:
+                self._post(self.do_scan)
         threading.Thread(target=work, daemon=True).start()
+
+    def _drop_old_network(self, old, old_gw, ni):
+        """换网后清理旧阻断：停线程、丢队列、清状态（在后台线程里做，避免 join 卡 UI）。"""
+        n = 0
+        try:
+            n = old.abandon()
+        except Exception as e:
+            self.log(f"清理旧阻断失败：{e}", "debug")
+        try:
+            self._stop_ndp()
+        except Exception:
+            pass
+        self._post(lambda: self.log(
+            f"网络已变更（旧网关 {old_gw} → 新网关 {ni.gateway_ip or '?'}），"
+            f"已中止对旧网络的阻断（{n} 台），请重新扫描后重新阻断", "err"))
+        self._post(self._render_rows)
+        self._post(self._update_buttons)
 
     # ------------------------------------------------------------ 扫描
 
@@ -754,6 +788,14 @@ class App(tk.Tk):
         for d in devs:
             if d.ip == ni.gateway_ip and not ni.gateway_mac:
                 ni.gateway_mac = d.mac
+        # 对抗性审查第 5 轮：Killer 持有的是建它时的 NetInfo 快照。换网后若继续沿用，
+        # 帧会一直发向旧网关 MAC —— 界面「阻断中」，目标照常上网（静默失效）。
+        if self._killer and self._killer.targets() \
+                and not self._killer.matches_network(ni):
+            old, old_gw = self._killer, self._killer.ni.gateway_ip or "?"
+            self._killer = None      # 立刻摘掉旧上下文：下次阻断必须用新 ni 重建
+            threading.Thread(target=self._drop_old_network,
+                             args=(old, old_gw, ni), daemon=True).start()
         self._net = ni
         self._devices = devs
         self._refresh_v6env(ni)
@@ -946,6 +988,10 @@ class App(tk.Tk):
         code, msg = core.l2_check()
         if code != "ok":
             raise core.BlockError(msg)
+        if self._killer and not self._killer.matches_network(self._net):
+            # 兜底：任何原因留下的旧上下文（换网早于扫描、外部改 ni）都在这里作废
+            self._killer.stop()
+            self._killer = None
         if not self._killer:
             ni = core.NetInfo(**self._net.__dict__)
             if not ni.gateway_mac:
@@ -1076,19 +1122,26 @@ class App(tk.Tk):
         return n
 
     def do_unblock_all(self):
-        if not self._killer or not self._killer.targets():
+        v4 = len(self._killer.targets()) if self._killer else 0
+        v6 = len(self._ndp_mgr.active_ips())
+        if not v4 and not v6:
             return
-        n = len(self._killer.targets())
-        if not messagebox.askyesno("确认放行", f"恢复全部 {n} 台设备的网络？"):
+        if not messagebox.askyesno("确认放行",
+                                   f"恢复全部 {v4 + v6} 台设备的网络？"
+                                   + (f"\n（IPv4 {v4} 台 / IPv6 {v6} 台）"
+                                      if v4 and v6 else "")):
             return
         self._set_busy(True, "正在恢复…")
 
         def work():
-            self._stop_ndp()
-            ok = self._killer.restore_all()
+            n6 = self._stop_ndp()
+            ok = self._killer.restore_all() if self._killer else 0
 
             def done():
-                self.log(f"已放行 {ok} 台，网络应已恢复", "ok")
+                if ok or n6:
+                    self.log(f"已放行 {ok} 台（IPv6 回填 {n6} 次），网络应已恢复", "ok")
+                else:
+                    self.log("放行失败：恢复帧未能发出，请检查网卡/管理员权限后重试", "err")
                 self._render_rows()
                 self._set_busy(False)
             self._post(done)
@@ -1103,9 +1156,16 @@ class App(tk.Tk):
             for ip in sel:
                 if ip in self._ndp_mgr.active_ips():
                     self._ndp_mgr.remove(ip)
+            fails = []
             if self._killer:
                 for ip in sel:
-                    self._killer.remove(ip)
+                    if not self._killer.remove(ip):
+                        fails.append(ip)
+            if fails:
+                # 恢复帧发不出去时不谎报成功：目标会留在队列里继续被投毒。
+                self._post(lambda: self.log(
+                    "放行失败（恢复帧未能发出，目标仍在阻断队列）：" + "、".join(fails),
+                    "err"))
             self._post(self._render_rows)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1190,29 +1250,63 @@ class App(tk.Tk):
             win.destroy()
             self._open_sentinel()
 
-        for it in pend[:6]:
-            row = tk.Frame(body, bg=ui.CARD)
-            row.pack(fill="x", pady=2)
-            tk.Label(row, text=f"{it.get('ip') or '?'}    {it['mac']}",
-                     bg=ui.CARD, fg=ui.TEXT2, font=self.F["small"]).pack(side="left")
+        # 对抗性审查第 5 轮：此前只渲染 pend[:6]，第 7 台起既看不到也认领不了，
+        # 面板反而成了「永远清不干净」的列表。改成可滚动的完整列表 + 选中操作 + 全部认领。
+        pcols = ("ip", "mac", "first")
+        pv = ttk.Treeview(body, columns=pcols, show="headings",
+                          height=min(8, max(3, len(pend))),
+                          selectmode="extended")
+        for cid, txt, w in (("ip", "IP", 150), ("mac", "MAC", 200),
+                            ("first", "首次出现", 150)):
+            pv.heading(cid, text=txt)
+            pv.column(cid, width=w, anchor="w", stretch=(cid == "mac"))
+        pv.pack(fill="x", pady=(6, 6))
+        for it in pend:
+            pv.insert("", "end", values=(
+                it.get("ip") or "?",
+                it.get("mac") or "",
+                time.strftime("%m-%d %H:%M", time.localtime(it.get("first", 0)))
+                if it.get("first") else "—"))
 
-            def _claim(m=it["mac"]):
+        def _sel_macs() -> list[str]:
+            return [pv.item(i, "values")[1] for i in pv.selection()]
+
+        def _claim_sel():
+            macs = _sel_macs()
+            if not macs:
+                messagebox.showinfo("哨兵", "先在上面的列表里选中要认领的设备。", parent=win)
+                return
+            for m in macs:
                 self._sentinel.claim(m)
-                self.log(f"[哨兵] 已认领 {m} 入基线", "ok")
-                _refresh()
+            self.log(f"[哨兵] 已认领 {len(macs)} 台设备入基线", "ok")
+            _refresh()
 
-            def _forget(m=it["mac"]):
+        def _forget_sel():
+            macs = _sel_macs()
+            if not macs:
+                messagebox.showinfo("哨兵", "先选中要移出的设备（下次出现会重新告警）。", parent=win)
+                return
+            for m in macs:
                 self._sentinel.forget(m)
-                self.log(f"[哨兵] 已将 {m} 移出基线", "info")
-                _refresh()
+            self.log(f"[哨兵] 已将 {len(macs)} 台设备移出基线", "info")
+            _refresh()
 
-            tk.Button(row, text="认领", command=_claim, width=6, relief="flat",
-                      bg=ui.OLIVE_BG, fg=ui.OLIVE_DK, font=self.F["tiny"],
-                      cursor="hand2", activebackground=ui.OLIVE_BG).pack(side="right")
-            tk.Button(row, text="移出", command=_forget, width=6, relief="flat",
-                      bg=ui.ROSE_BG, fg=ui.ROSE_DK, font=self.F["tiny"],
-                      cursor="hand2", activebackground=ui.ROSE_BG).pack(
-                side="right", padx=6)
+        def _claim_all():
+            if not pend:
+                return
+            for it in pend:
+                self._sentinel.claim(it["mac"])
+            self.log(f"[哨兵] 已全部认领（{len(pend)} 台）", "ok")
+            _refresh()
+
+        brow = tk.Frame(body, bg=ui.CARD)
+        brow.pack(fill="x")
+        for txt, cmd, bg, fg in (("认领选中", _claim_sel, ui.OLIVE_BG, ui.OLIVE_DK),
+                                 ("移出选中", _forget_sel, ui.ROSE_BG, ui.ROSE_DK),
+                                 ("全部认领", _claim_all, ui.CARD_ALT, ui.TEXT)):
+            tk.Button(brow, text=txt, command=cmd, relief="flat", bd=0,
+                      bg=bg, fg=fg, font=self.F["tiny"], padx=12, pady=4,
+                      cursor="hand2", activebackground=bg).pack(side="left", padx=(0, 8))
 
         tk.Label(body, text=f"事件历史（最近 {len(self._sentinel.events)} 条）",
                  bg=ui.CARD, fg=ui.TEXT, font=self.F["small"]).pack(
@@ -1373,18 +1467,20 @@ class App(tk.Tk):
             self._tray.notify("WiFiKill 仍在运行", "右键托盘图标可以显示主界面或退出")
 
     def _tray_release(self):
-        if not self._killer or not self._killer.targets():
+        v4 = len(self._killer.targets()) if self._killer else 0
+        v6 = len(self._ndp_mgr.active_ips())
+        if not v4 and not v6:
             self._show_window()
             self.log("当前没有阻断目标", "info")
             return
         self._set_busy(True, "正在放行…")
 
         def work():
-            self._stop_ndp()
-            n = self._killer.restore_all()
+            n6 = self._stop_ndp()
+            n = self._killer.restore_all() if self._killer else 0
 
             def done():
-                self.log(f"从托盘放行 {n} 台", "ok")
+                self.log(f"从托盘放行 {n} 台（IPv6 回填 {n6} 次）", "ok")
                 if self._tray:
                     self._tray.notify("已全部放行", f"{n} 台设备网络已恢复")
                 self._render_rows()

@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.6.2"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -640,11 +640,18 @@ def load_aliases() -> dict[str, str]:
 
 
 def save_aliases(items: dict[str, str]) -> None:
-    """原子写备注，避免崩溃留下半个 JSON。"""
-    tmp = ALIAS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
-    os.replace(tmp, ALIAS_FILE)
+    """原子写备注，避免崩溃留下半个 JSON。
+
+    写失败（程序目录只读 / 被占用）不抛给 GUI：备注是锦上添花，
+    不该让一次改名把 Tk 回调打崩。
+    """
+    try:
+        tmp = ALIAS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, ALIAS_FILE)
+    except Exception as e:
+        LOG.emit("warn", f"设备备注写入失败：{e}")
 
 
 def save_whitelist(items: set[str]):
@@ -671,6 +678,36 @@ class Target:
 
 class BlockError(RuntimeError):
     pass
+
+
+def state_targets(data: dict | None) -> list["Target"]:
+    """把状态文件里的 targets 解析成 Target 列表，非法条目跳过并记录。
+
+    对抗性审查第 5 轮：GUI 恢复流程此前直接 `it["ip"]`，遇到缺字段 / 手改过的
+    / 半截写入的状态文件就抛 KeyError —— 而它跑在工作线程里，异常只进 traceback，
+    用户什么都看不到，程序表现为「恢复提示点了没反应」。解析下沉到逻辑层后可单测。
+    """
+    out: list[Target] = []
+    items = (data or {}).get("targets")
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        if not isinstance(it, dict):
+            LOG.emit("warn", f"状态文件里有一条记录不是对象，已跳过：{it!r}")
+            continue
+        ip = str(it.get("ip") or "").strip()
+        mac = str(it.get("mac") or "").strip().lower()
+        if not _IP_RE.match(ip) or not _MAC_RE.match(mac):
+            LOG.emit("warn",
+                     f"状态文件里有一条记录地址不合法，已跳过（ip={ip!r} mac={mac!r}）")
+            continue
+        try:
+            duty = int(it.get("duty", 100))
+        except (TypeError, ValueError):
+            duty = 100
+        out.append(Target(ip, mac, note=str(it.get("note") or ""),
+                          duty=max(10, min(100, duty))))
+    return out
 
 
 class Killer:
@@ -829,7 +866,15 @@ class Killer:
         self._frames(t, restore=False)   # 先验证报文可构造
         with self._lock:
             self._targets[t.key()] = t
-        self._emit(t, count=3)
+        try:
+            self._emit(t, count=3)       # 首发成功才算真的入队
+        except Exception:
+            # 对抗性审查第 5 轮：此前发送失败只抛异常却不回滚，目标留在队列里，
+            # 投毒线程起来后照样打它 —— 用户看到「跳过」，设备其实被断。
+            with self._lock:
+                self._targets.pop(t.key(), None)
+            self.persist()
+            raise
         self.persist()
 
     def remove(self, ip: str) -> bool:
@@ -873,6 +918,46 @@ class Killer:
         th = self._thread
         if th and th.is_alive():
             th.join(timeout=3)
+            if th.is_alive():
+                # 残余风险如实告知：线程可能正卡在 sendp 里，最后一批投毒帧会与
+                # 紧随其后的恢复帧交叉，目标可能仍处于被阻断状态。
+                LOG.emit("warn", "投毒线程未在 3 秒内退出，恢复帧可能与最后一批投毒帧交叉；"
+                                 "若目标仍无法上网，请再点一次「全部放行」")
+
+    _NET_KEYS = ("iface", "gateway_ip", "gateway_mac")
+
+    def matches_network(self, ni: "NetInfo") -> bool:
+        """当前投毒上下文是否仍属于最新扫描到的网络。
+
+        对抗性审查第 5 轮：Killer 持有的是创建时的 NetInfo 快照。换 Wi-Fi / 换路由器后
+        若继续沿用旧快照，帧会发向旧网关 MAC —— 界面写着「阻断中」，目标照常上网，
+        又是一次静默失效。GUI 每次扫描后用它判定是否需要中止旧阻断。
+
+        「不一致」的判定必须**两侧都非空**：某次扫描探测失败会给出空 iface / 空网关 MAC，
+        若把「空 vs 有值」当成换网，就会把正在生效的阻断误杀 —— 这是比漏判更糟的假阳性。
+        比对项：网卡、网关 IP、网关 MAC（后者覆盖「同一 IP 换了路由器」）。
+        """
+        for key in self._NET_KEYS:
+            mine = str(getattr(self.ni, key, "") or "").strip().lower()
+            cur = str(getattr(ni, key, "") or "").strip().lower()
+            if mine and cur and mine != cur:
+                return False
+        return True
+
+    def abandon(self) -> int:
+        """网络已变更：停止投毒并丢弃队列（旧目标不属于新网络，不再回填）。
+
+        不回填是刻意的：向新网络发送旧网关/旧目标的映射帧既救不回顾设备，
+        也可能在新网段制造无意义广播。状态文件一并清除，避免下次启动误恢复。
+        """
+        self.stop()
+        with self._lock:
+            n = len(self._targets)
+            self._targets.clear()
+        clear_state()
+        if n:
+            LOG.emit("warn", f"网络已变更，已停止对旧网络的阻断（{n} 台目标已丢弃）")
+        return n
 
     def persist(self):
         if self.dry_run:
@@ -1359,8 +1444,17 @@ class Sentinel:
         try:
             if SENTINEL_FILE.exists():
                 data = json.loads(SENTINEL_FILE.read_text(encoding="utf-8"))
-                self._known = data.get("known") or {}
-                self.events = data.get("events") or []
+                # 对抗性审查第 5 轮：损坏/手改过的基线（known 写成 list、events 写成
+                # 字符串）此前会被原样收下，随后每次扫描在 feed_scan 里炸 AttributeError。
+                known = data.get("known")
+                events = data.get("events")
+                self._known = ({k: v for k, v in known.items()
+                                if isinstance(k, str) and isinstance(v, dict)}
+                               if isinstance(known, dict) else {})
+                self.events = [e for e in events if isinstance(e, dict)] \
+                    if isinstance(events, list) else []
+                if not isinstance(known, dict) or not isinstance(events, list):
+                    LOG.emit("warn", "哨兵基线格式异常，已按空基线重建")
         except Exception as e:
             LOG.emit("debug", f"哨兵基线读取失败（按空基线处理）：{e}")
             self._known, self.events = {}, []

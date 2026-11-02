@@ -21,6 +21,21 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v4
 
+      - name: 校验 tag 与 versions.json 一致
+        shell: bash
+        run: |
+          set -e
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "非 tag 触发（${GITHUB_REF}），跳过版本一致性校验"
+            exit 0
+          fi
+          APP=$(python -c "import json;print(json.load(open('versions.json',encoding='utf-8'))['app'])")
+          echo "tag=${GITHUB_REF_NAME} versions.json app=${APP}"
+          if [ "v${APP}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 versions.json 的 ${APP} 不一致 —— 产物名与 Release 标题会错配。请先 python build.py 并提交 versions.json 后再打 tag。"
+            exit 1
+          fi
+
       - name: 准备 Python（完整版，含 tkinter）
         # 说明：actions/setup-python 在 Windows 上使用的是 actions/python-versions
         # 预构建二进制，默认不含 tcl/tk，导致 build.py ensure_env() 的
@@ -82,50 +97,6 @@ jobs:
           set -e
           python tests/test_throttle.py
 
-      - name: 诊断-回传测试失败详情
-        if: failure()
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          {
-            echo "===== 环境 ====="
-            python -c "import sys, scapy, tkinter; print('python', sys.executable, sys.version); print('scapy', scapy.__version__)"
-            echo "----- arp -a -----"
-            arp -a 2>&1 | head -30
-            echo "----- t_bad_cidr 直接复现 -----"
-            python -c "import core; ni=core.NetInfo(iface='test0',my_ip='10.0.0.2',my_mac='aa:bb:cc:dd:ee:01',gateway_ip='10.0.0.1',gateway_mac='aa:bb:cc:dd:ee:02',cidr='not-a-cidr',iface_name='Test IF'); print(core.scan(ni,0.3,active=False))"
-            echo "===== test_edge 全量输出 ====="
-            python tests/test_edge.py 2>&1
-            echo "edge_exit=$?"
-            echo "===== test_ipv6 全量输出 ====="
-            python tests/test_ipv6.py 2>&1
-            echo "ipv6_exit=$?"
-            echo "===== test_guard 全量输出 ====="
-            python tests/test_guard.py 2>&1
-            echo "guard_exit=$?"
-            echo "===== test_sentinel 全量输出 ====="
-            python tests/test_sentinel.py 2>&1
-            echo "sentinel_exit=$?"
-          } > ci-diag.txt
-          FNAME="ci-diag-${{ github.run_id }}.txt"
-          B64=$(base64 -w0 ci-diag.txt 2>/dev/null || base64 ci-diag.txt | tr -d '\n')
-          BASE_SHA=$(git rev-parse HEAD)
-          # 先创建 ci-diag 分支（contents API 不能创建分支，只能提交到已存在分支）
-          REF_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/Asaceoo/WiFi-Kill/git/refs" \
-            -d "{\"ref\":\"refs/heads/ci-diag\",\"sha\":\"${BASE_SHA}\"}")
-          # 提交诊断文件到 ci-diag 分支
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/Asaceoo/WiFi-Kill/contents/${FNAME}" \
-            -d "{\"message\":\"ci diag run ${{ github.run_id }}\",\"content\":\"${B64}\",\"branch\":\"ci-diag\"}")
-          echo "create_ref_http=$REF_HTTP commit_http=$HTTP file=${FNAME}"
-
       - name: 构建三种产物
         run: python build.py --no-bump
 
@@ -144,23 +115,42 @@ jobs:
           body: |
             ## 本版重点（${{ github.ref_name }}）
 
-            **第 4 轮对抗性审查收敛 · 占空比限速 + 全网哨兵的修复与文档补全 · 测试 129 项**
+            **对抗性审查第 5–6 轮 · 三份文档重写 · 发布链加固 · 测试 148 项**
 
-            ### 🔧 修复（实现者视角）
+            ### 🔧 实现者视角（实现正确性）
 
-            - **崩溃恢复丢失限速状态**：占空比随阻断状态落盘，但恢复路径漏读
-              `duty` 字段 —— 崩溃重启后限速目标会静默变回全断。已修复。
+            - **发送失败不回滚队列**：`Killer.add()` 首发失败时目标仍留在队列，投毒线程照样打它，
+              而界面已记成「跳过」。现在失败即出队、不落状态。
+            - **状态文件坏记录掀翻恢复链**：恢复流程直接取 `it["ip"]`，缺字段即 `KeyError`，
+              而它跑在工作线程里 —— 用户只看到「点了没反应」。解析下沉 `core.state_targets()`。
+            - **损坏的哨兵基线每次扫描都炸**：`known` 被写成 list 时 `feed_scan()` 抛
+              `AttributeError`。现在按空基线自愈。
 
-            ### 🛡️ 诚实性（审查者视角）
+            ### 🛡️ 审查者视角（不变量与失控面）
 
-            - **投毒者指认措辞降级**：以太网源 MAC 可被攻击者冒用无辜设备，
-              指认结论从「投毒者已定位」改为**「疑似投毒者（MAC 可伪造，供参考）」**，
-              不做定罪式断言。
+            - **换网后继续打旧网关**：`Killer` 持有旧 `NetInfo` 快照，换 Wi-Fi 后帧仍发向旧网关 MAC
+              —— 界面「阻断中」，目标照常上网。新增 `matches_network()` / `abandon()`，扫描后比对即中止。
+            - **只剩 IPv6 目标时「全部放行」被判死**：按钮与放行入口只看 IPv4 队列，
+              IPv6 阻断只能靠退出程序停止。现已把 IPv6 目标一并计入。
+            - **逐台放行谎报成功**：恢复帧发不出去时不再静默，明确报 err。
 
-            ### 📚 文档（AI 使用方视角）
+            ### 📚 AI 使用方视角（诚实性）
 
-            - 技术手册补 §2.8 全网哨兵 / §2.9 占空比限速设计说明与测试矩阵（11.7/11.8）；
-              CLAUDE.md 同步 v2.6.0 代码事实（新增两条红线：ui 常量先查后用、core 禁自引用）。
+            - IPv6 横幅「同时仅支持 1 台目标」过期（v2.4.0 起多目标并发）→ 已改正。
+            - 哨兵面板只渲染前 6 台待认领 → 改为完整可滚动列表 + 选中认领/移出 + 全部认领。
+
+            ### 📦 第 6 轮 · 发布链与文档
+
+            - **三份文档重写**：README（概念图 + 用法/使用说明 + 20 个使用实例 + 免责声明）、
+              `docs/USER_MANUAL.md`（教程 A–N + 故障排查表 + 卸载清理）、
+              `docs/TECH_MANUAL.md`（报文/线程/状态机/护栏/测试/发布流水线）。
+            - **版本同步加硬校验**：构建时校验 README 徽章、版本表与两份手册头部，
+              格式漂移导致版本静默不同步时**直接中止构建**。
+            - **打包版与安装包补概念图**：README 用相对路径引用图片，离线解压不再裂图。
+            - **安装向导加免责声明页**（`LicenseFile`），必须勾选同意才能继续；
+              卸载时清理全部运行时状态文件。
+            - **CI 校验 tag 与 `versions.json` 一致**，不一致直接失败；删除历史调试步骤。
+            - 移除被误提交的 PyInstaller 生成物 `WiFiKill.spec`（内含本机绝对路径）。
 
             ### 🌐 既有功能（全部保留并回归）
 
@@ -169,8 +159,8 @@ jobs:
 
             ### 🔬 验证
 
-            - 无头：**边界 34 + IPv6 58 + 守护 21 + 哨兵 10 + 限速 6 = 129 项** 全绿
-            - 真机：`selftest.py` 46 项 0 失败（真实 GUI + 幽灵设备端到端）
+            - 无头：**边界 52 + IPv6 58 + 守护 21 + 哨兵 11 + 限速 6 = 148 项** 全绿
+            - 真机：`selftest.py` **51 项 0 失败**（真实 GUI + 幽灵设备端到端）
 
             ## 三种形态，按需选择
 

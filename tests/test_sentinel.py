@@ -224,6 +224,29 @@ def test_guard_hunt_dry_run_silent(monkeypatch):
     assert events == []
 
 
+def test_sentinel_corrupt_baseline_selfheals(monkeypatch):
+    """基线被写坏时自愈，而不是每次扫描都炸。
+
+    修复前：load() 原样收下 {"known": [...], "events": "boom"}，
+    feed_scan 第一件事就是 self._known.get() → AttributeError('list' object
+    has no attribute 'get')，而它跑在 GUI 的扫描回调里，表现为「哨兵一直没反应」。
+    """
+    path = _tmp_sentinel(monkeypatch)
+    path.write_text(json.dumps({"known": ["x"], "events": "boom"}), encoding="utf-8")
+    sen = core.Sentinel()
+    assert isinstance(sen._known, dict), repr(sen._known)
+    assert sen.events == [], repr(sen.events)
+    new = sen.feed_scan([_Dev("192.168.1.5", "aa:bb:cc:dd:ee:05")])
+    assert new == [], new                      # 视为空基线 = 首次运行，静默入册
+    assert sen._known["aa:bb:cc:dd:ee:05"]["known"] is True
+    # 记录项本身不是 dict 时同样要被剔除
+    path.write_text(json.dumps({"known": {"aa:bb:cc:dd:ee:01": "oops"},
+                                "events": [{"kind": "new"}, "junk"]}), encoding="utf-8")
+    sen2 = core.Sentinel()
+    assert sen2._known == {}, repr(sen2._known)
+    assert len(sen2.events) == 1, repr(sen2.events)
+
+
 if __name__ == "__main__":
     class _MP:
         """极简 monkeypatch 替身：每个用例结束自动还原。"""

@@ -301,12 +301,100 @@ def t_autostart_registry():
         core.winreg = orig
 
 
+# ---------------------------------------------------------------- 第 5 轮
+# 下面四条都来自「真实报错闭环」：先写出可复现的最小探针看到红，再改代码到绿。
+
+
+@case
+def t_add_rollback_on_send_failure():
+    """发送失败必须回滚队列。
+
+    修复前：add() 先把目标塞进 _targets 再发首帧，sendp 抛异常只往外抛，
+    目标留在队列里 —— 投毒线程一起来照样打它，而 GUI 已经把这次记为「跳过」。
+    """
+    core.clear_state()
+    k = core.Killer(fake_net(), dry_run=False)
+    k._started = True        # 跳过二层可用性门槛：本机/CI 未必装了 Npcap
+    s = core.scapy_mod()
+    if s is None:
+        check("scapy 可用（否则本用例无意义）", False, "scapy 未加载")
+        return
+    real = s.sendp
+    def boom(*_a, **_kw):
+        raise OSError("simulated nic failure")
+    s.sendp = boom
+    raised = False
+    try:
+        k.add(core.Target("10.0.0.9", "aa:bb:cc:dd:ee:09"))
+    except core.BlockError:
+        raised = True
+    finally:
+        s.sendp = real
+    check("发送失败抛 BlockError", raised)
+    check("发送失败后目标回滚出队列", len(k.targets()) == 0, str(k.targets()))
+    check("发送失败后不残留状态文件", not core.STATE_FILE.exists())
+
+
+@case
+def t_state_targets_sanitize():
+    """状态文件里的一条坏记录不能掀翻整条恢复链（缺字段曾抛 KeyError）。"""
+    st = {"targets": [
+        {"mac": "aa:bb:cc:dd:ee:50"},                                   # 缺 ip
+        {"ip": "10.0.0.7", "mac": "aa:bb:cc:dd:ee:07", "duty": "abc"},   # duty 非数字
+        "garbage",                                                       # 非对象
+        {"ip": "10.0.0.8", "mac": "zz:zz"},                              # MAC 非法
+        {"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:09", "duty": 5},       # duty 太低
+        {"ip": "10.0.0.10", "mac": "aa:bb:cc:dd:ee:0a", "duty": 999},    # duty 太高
+    ]}
+    ts = core.state_targets(st)
+    check("坏记录被跳过，好记录全留", [t.ip for t in ts] ==
+          ["10.0.0.7", "10.0.0.9", "10.0.0.10"], str([t.ip for t in ts]))
+    check("duty 非数字回落 100", ts[0].duty == 100, str(ts[0].duty) if ts else "空")
+    check("duty 下限夹到 10", ts[1].duty == 10, str(ts[1].duty) if len(ts) > 1 else "空")
+    check("duty 上限夹到 100", ts[2].duty == 100, str(ts[2].duty) if len(ts) > 2 else "空")
+    check("None / 空字典安全", core.state_targets(None) == [] and core.state_targets({}) == [])
+    check("targets 不是列表时安全", core.state_targets({"targets": "x"}) == [])
+    check("duty 默认 100 时也能入列",
+          core.state_targets({"targets": [{"ip": "10.0.0.11", "mac": "aa:bb:cc:dd:ee:0b"}]})[0].duty == 100)
+
+
+@case
+def t_network_change_abandons():
+    """换网络后旧阻断必须中止，且状态文件不能留着让下次启动误恢复。"""
+    core.clear_state()
+    ni = fake_net()
+    k = core.Killer(ni, dry_run=True)
+    k.add(core.Target("10.0.0.9", "aa:bb:cc:dd:ee:09"))
+    k.persist()
+    check("同网络判定为同一上下文", k.matches_network(fake_net()))
+    other = core.NetInfo(iface="test0", my_ip="192.168.5.2",
+                         my_mac="aa:bb:cc:dd:ee:31", gateway_ip="192.168.5.1",
+                         gateway_mac="aa:bb:cc:dd:ee:32", cidr="192.168.5.0/24")
+    check("换网关后判定为不同上下文", not k.matches_network(other))
+    # 探测失败（空 iface / 空网关 MAC）不能被当成换网，否则会把生效中的阻断误杀
+    blank = core.NetInfo(iface="", my_ip="", my_mac="", gateway_ip="", gateway_mac="",
+                         cidr="")
+    check("探测为空时不误判换网", k.matches_network(blank))
+    same_gw_new_router = core.NetInfo(iface="test0", my_ip="10.0.0.2",
+                                      my_mac="aa:bb:cc:dd:ee:01", gateway_ip="10.0.0.1",
+                                      gateway_mac="aa:bb:cc:dd:ee:99", cidr="10.0.0.0/24")
+    check("同一网关 IP 换了路由器也算变更", not k.matches_network(same_gw_new_router))
+    n = k.abandon()
+    check("abandon 返回丢弃台数", n == 1, str(n))
+    check("abandon 清空队列", len(k.targets()) == 0, str(k.targets()))
+    check("abandon 清除状态文件", not core.STATE_FILE.exists())
+    check("abandon 幂等", k.abandon() == 0)
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
                t_whitelist_mac, t_restore_clears, t_stop_is_clean,
                t_logger_isolation, t_protected_device, t_protected_api,
-               t_autostart_registry):
+               t_autostart_registry,
+               # 第 5 轮：真实报错闭环补进来的回归
+               t_add_rollback_on_send_failure, t_state_targets_sanitize,
+               t_network_change_abandons):
         fn()
 
     print("\n=========== 边界测试 ===========")

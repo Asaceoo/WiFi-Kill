@@ -31,7 +31,6 @@ VERSIONS = ROOT / "versions.json"
 DOCS = ROOT / "docs"
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
-SPEC = ROOT / "WiFiKill.spec"
 
 DOC_FILES = {
     "user_manual": DOCS / "USER_MANUAL.md",
@@ -109,6 +108,43 @@ def sync_docs(v: dict):
             readme.write_text(n, encoding="utf-8")
             changed.append("README.md")
     return changed
+
+
+
+
+def verify_doc_versions(v: dict) -> list[str]:
+    """同步后严格校验：三处版本标记必须等于目标版本，否则构建直接失败。
+
+    对抗性审查第 6 轮：sync_docs() 只用正则替换，README / 手册的格式一变就**静默
+    匹配不到**，发布物会带着旧版本号出厂且没有任何提示（探针已复现）。
+    """
+    problems: list[str] = []
+    readme = ROOT / "README.md"
+    if readme.exists():
+        t = readme.read_text(encoding="utf-8")
+        m = re.search(r"badge/version-v(\d+\.\d+\.\d+)", t)
+        if not m or m.group(1) != v["app"]:
+            problems.append(f"README badge = {m.group(1) if m else '未找到'}，应为 {v['app']}")
+        m = re.search(r"\| 程序 \| \*\*v(\d+\.\d+\.\d+)\*\*", t)
+        if not m or m.group(1) != v["app"]:
+            problems.append(f"README 版本表 = {m.group(1) if m else '未找到'}，应为 {v['app']}")
+        for label, key in (("用户手册", "user_manual"), ("技术手册", "tech_manual")):
+            pat = r"\| \[%s\]\(docs/[A-Z_]+\.md\) \| v(\d+\.\d+\.\d+) \|" % label
+            m = re.search(pat, t)
+            if not m or m.group(1) != v[key]:
+                problems.append(f"README {label}版本 = {m.group(1) if m else '未找到'}，应为 {v[key]}")
+    for key, path in DOC_FILES.items():
+        if not path.exists():
+            problems.append(f"缺少文档：{path.name}")
+            continue
+        t = path.read_text(encoding="utf-8")
+        m = re.search(r"文档版本：\*\*v(\d+\.\d+\.\d+)\*\*", t)
+        if not m or m.group(1) != v[key]:
+            problems.append(f"{path.name} 文档版本 = {m.group(1) if m else '未找到'}，应为 {v[key]}")
+        m = re.search(r"对应程序：\*\*v(\d+\.\d+\.\d+)\*\*", t)
+        if not m or m.group(1) != v["app"]:
+            problems.append(f"{path.name} 对应程序 = {m.group(1) if m else '未找到'}，应为 {v['app']}")
+    return problems
 
 
 def version_tuple(v: str) -> tuple[int, int, int, int]:
@@ -214,6 +250,9 @@ def make_zip(v: dict, exe: Path) -> Path:
         (DOCS / "TECH_MANUAL.md", "docs/TECH_MANUAL.md"),
         (ROOT / "LICENSE.txt", "LICENSE.txt"),
     ]
+    # README 用相对路径引用概念图，打包版必须把图一起带上，否则离线阅读全是裂图
+    for img in sorted((DOCS / "images").glob("*.png")):
+        payload.append((img, f"docs/images/{img.name}"))
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for src, arc in payload:
             if src.exists():
@@ -278,6 +317,11 @@ def main():
     changed = sync_docs(v)
     if changed:
         print(f"[*] 已同步文档版本：{', '.join(changed)}")
+    problems = verify_doc_versions(v)
+    if problems:
+        raise SystemExit("[-] 文档版本校验失败（构建中止，避免带旧版本号出厂）：\n  - "
+                         + "\n  - ".join(problems))
+    print("[*] 文档版本校验通过（README badge/版本表 + 两份手册头部）")
 
     exe = DIST / "WiFiKill.exe"
     if not args.zip_only:

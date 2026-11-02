@@ -30,6 +30,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 AllowNoIcons=yes
 CloseApplications=yes
+; 合规要求：安装向导先展示免责声明，必须勾选同意才能继续
+LicenseFile=DISCLAIMER.txt
 
 [Languages]
 Name: "zh"; MessagesFile: "ChineseSimplified.isl"
@@ -43,10 +45,13 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\USER_MANUAL.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\TECH_MANUAL.md"; DestDir: "{app}\docs"; Flags: ignoreversion
+; README 用相对路径引用概念图，安装目录里也要有图，否则离线阅读全是裂图
+Source: "..\docs\images\*.png"; DestDir: "{app}\docs\images"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\WiFiKill"; Filename: "{app}\{#AppExe}"
 Name: "{group}\用户手册"; Filename: "{app}\docs\USER_MANUAL.md"
+Name: "{group}\技术手册"; Filename: "{app}\docs\TECH_MANUAL.md"
 Name: "{group}\卸载 WiFiKill"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\WiFiKill"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
@@ -57,3 +62,6 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,WiFiKill}"; Flags: 
 [UninstallDelete]
 Type: files; Name: "{app}\.wifikill-state.json"
 Type: files; Name: "{app}\whitelist.txt"
+Type: files; Name: "{app}\aliases.json"
+Type: files; Name: "{app}\guard.json"
+Type: files; Name: "{app}\sentinel.json"
