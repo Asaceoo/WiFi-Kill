@@ -166,9 +166,9 @@ jobs:
 
             | 形态 | 文件 | 说明 |
             |---|---|---|
-            | **安装版** | `WiFiKill-${{ github.ref_name }}-setup.exe` | 中文安装向导，带开始菜单/桌面快捷方式与卸载 |
+            | **安装版** | `WiFiKill-${{ github.ref_name }}-setup.exe` | 中文向导（首屏免责声明）+ 开始菜单/桌面快捷方式 + 卸载 |
             | **单文件版** | `WiFiKill-${{ github.ref_name }}.exe` | 绿色单文件，拷走即用 |
-            | **打包版** | `WiFiKill-${{ github.ref_name }}-portable.zip` | exe + 用户手册 + 技术手册 + 许可 |
+            | **打包版** | `WiFiKill-${{ github.ref_name }}-portable.zip` | exe + README + 用户手册 + 技术手册 + 概念图 + 许可 |
 
             另附：`README.md`、`docs/USER_MANUAL.md`、`docs/TECH_MANUAL.md` 为最新版本文档。
 
