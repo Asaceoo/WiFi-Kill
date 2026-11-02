@@ -386,6 +386,87 @@ def t_network_change_abandons():
     check("abandon 幂等", k.abandon() == 0)
 
 
+# ---------------------------------------------------------------- 第 7 轮
+# 关闭「恢复帧与在途投毒帧交叉」窗口：会话代际 + 发送锁。
+
+
+@case
+def t_stale_generation_refuses_send():
+    """停止/恢复推进代际后，过期批次的投毒帧必须一帧都发不出去。"""
+    s = core.scapy_mod()
+    if s is None:
+        check("scapy 可用（否则本用例无意义）", False, "scapy 未加载")
+        return
+    sent = []
+    real = s.sendp
+    s.sendp = lambda pkt, **kw: sent.append(pkt["ARP"].psrc)
+    try:
+        k = core.Killer(fake_net(), dry_run=False)
+        k._started = True
+        t = core.Target("10.0.0.9", "aa:bb:cc:dd:ee:09")
+        gen = k._gen
+        k._emit(t, gen=gen)                    # 当代际：正常发送 2 帧
+        n = len(sent)
+        k._bump_gen()                          # 模拟 stop()/remove() 推进代际
+        k._emit(t, gen=gen)                    # 过期批次：必须被拦下
+        check("当代际可正常发送", n == 2, str(n))
+        check("过期批次被拦下（不再补投毒帧）", len(sent) == n, str(len(sent)))
+        check("作废计数递增", k._late_sends == 1, str(k._late_sends))
+    finally:
+        s.sendp = real
+
+
+@case
+def t_restore_frames_come_last():
+    """恢复帧必须排在最后：sendp 变慢造成真实重叠时也不许越位。"""
+    import time
+    s = core.scapy_mod()
+    if s is None:
+        check("scapy 可用（否则本用例无意义）", False, "scapy 未加载")
+        return
+    sent = []
+    real = s.sendp
+
+    def slow_sendp(pkt, **kw):
+        time.sleep(0.05)                      # 制造在途帧，逼出顺序问题
+        sent.append(pkt["ARP"].hwsrc)
+
+    s.sendp = slow_sendp
+    try:
+        k = core.Killer(fake_net(), interval=0.05)
+        k._started = True
+        k.add(core.Target("10.0.0.9", "aa:bb:cc:dd:ee:09"))
+        k.start()
+        time.sleep(0.3)
+        k.restore_all()
+        time.sleep(0.3)                       # 留时间给任何可能迟到的帧
+        my_mac = fake_net().my_mac
+        first_restore = next((i for i, h in enumerate(sent)
+                              if h in (fake_net().gateway_mac, 'aa:bb:cc:dd:ee:09')), None)
+        tail = [h for h in sent[(first_restore or 0) + 1:] if h == my_mac] if first_restore is not None else []
+        check("确实发过恢复帧", first_restore is not None, str(len(sent)))
+        check("恢复帧之后没有投毒帧", not tail, str(tail[:3]))
+        check("恢复后队列已清空", not k.targets(), str(k.targets()))
+    finally:
+        s.sendp = real
+
+
+@case
+def t_arp_row_conversion():
+    """WinAPI 邻居表行的转换（纯函数）：过滤无效/组播/广播，IP 字节序正确。"""
+    rows = [
+        (0x0500000A, b"\xaa\xbb\xcc\xdd\xee\x01", 3),      # 10.0.0.5 动态
+        (0x0900000A, b"\xaa\xbb\xcc\xdd\xee\x02", 2),      # 无效项 → 丢
+        (0x0A0000E0, b"\x01\x00\x5e\x00\x00\x01", 3),      # 224.0.0.10 组播 → 丢
+        (0x0100000A, b"\xaa\xbb", 3),                        # 物理地址太短 → 丢
+        (0x0100000A, b"\xaa\xbb\xcc\xdd\xee\x03", 4),      # 10.0.0.1 静态
+    ]
+    table = core._arp_rows_to_table(rows)
+    check("转换结果只留合法项", sorted(table) == ["10.0.0.1", "10.0.0.5"], str(table))
+    check("MAC 格式正确", table.get("10.0.0.5") == "aa:bb:cc:dd:ee:01", str(table))
+    check("空输入安全", core._arp_rows_to_table([]) == {})
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
@@ -394,7 +475,10 @@ def main():
                t_autostart_registry,
                # 第 5 轮：真实报错闭环补进来的回归
                t_add_rollback_on_send_failure, t_state_targets_sanitize,
-               t_network_change_abandons):
+               t_network_change_abandons,
+               # 第 7 轮：发送顺序 / 邻居表转换
+               t_stale_generation_refuses_send, t_restore_frames_come_last,
+               t_arp_row_conversion):
         fn()
 
     print("\n=========== 边界测试 ===========")

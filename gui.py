@@ -774,7 +774,14 @@ class App(tk.Tk):
             try:
                 ni = core.get_netinfo(cidr)
                 if not ni.gateway_ip:
-                    self._post(lambda: self.log("无法确定网关，请检查是否已联网", "err"))
+                    def _no_gw():
+                        n = len(self._killer.targets()) if self._killer else 0
+                        if n:
+                            self.log(f"无法确定网关：本次扫描中断，仍有 {n} 台设备处于阻断状态，"
+                                     f"其是否仍有效无法确认（请检查网络后重新扫描）", "err")
+                        else:
+                            self.log("无法确定网关，请检查是否已联网", "err")
+                    self._post(_no_gw)
                     return
                 devs, active = core.scan(ni, timeout=2.0, active=True)
                 self._post(lambda: self._apply_scan(ni, devs, active))
@@ -790,7 +797,14 @@ class App(tk.Tk):
                 ni.gateway_mac = d.mac
         # 对抗性审查第 5 轮：Killer 持有的是建它时的 NetInfo 快照。换网后若继续沿用，
         # 帧会一直发向旧网关 MAC —— 界面「阻断中」，目标照常上网（静默失效）。
+        # 探测失败（拿不到网卡/网关）时无法判定上下文是否仍然有效：不误杀阻断，
+        # 但必须说清楚——否则又是一次「界面阻断中、实际可能已失效」的静默状态。
         if self._killer and self._killer.targets() \
+                and (not ni.gateway_ip or not ni.iface):
+            self.log("本次扫描未拿到网关或网卡信息，无法确认当前阻断是否仍然有效；"
+                     "请检查网络连接后重新扫描", "warn")
+        if self._killer and self._killer.targets() \
+                and ni.gateway_ip and ni.iface \
                 and not self._killer.matches_network(ni):
             old, old_gw = self._killer, self._killer.ni.gateway_ip or "?"
             self._killer = None      # 立刻摘掉旧上下文：下次阻断必须用新 ni 重建

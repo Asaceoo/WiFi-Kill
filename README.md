@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="https://img.shields.io/badge/version-v2.6.2-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.6.3-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/python-3.10%2B-8C9E93" alt="python">
 <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-8C9E93" alt="platform">
 <img src="https://img.shields.io/badge/license-学习研究用-C4A785" alt="license">
@@ -209,7 +209,7 @@ ARP 层**做不了真限速**（NetCut 那种限速依赖网关配合）。WiFiK
 | `ui.py` | 视觉层：莫兰迪色板、圆角绘制、Canvas 按钮、动效调度 |
 | `tray.py` | 系统托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、多目标定向 NDP 投毒与失控保护 |
-| `tests/` | 五套无头测试共 **148 项**：边界 52 + IPv6 报文 58 + 守护 21 + 哨兵 11 + 限速 6 |
+| `tests/` | 六套无头测试共 **176 项**：边界 61 + IPv6 报文 58 + 守护 21 + 哨兵 11 + 限速 6 + GUI 冒烟 19 |
 | `selftest.py` | GUI 端到端自检（51 项，会驱动真实界面） |
 | `build.py` | 一键构建：版本自增 → 文档版本同步与校验 → 出三个产物 |
 | `installer/` | Inno Setup 脚本、中文语言文件与免责声明 |
@@ -229,6 +229,19 @@ ARP 层**做不了真限速**（NetCut 那种限速依赖网关配合）。WiFiK
 5. **换网络即中止** —— 阻断会话持有网络快照，扫描发现网卡/网关变化立即停止旧阻断并告警，
    不留「界面阻断中、目标照常上网」的静默失效。
 6. **单实例** —— 本地端口互斥，避免两个实例互相覆盖状态文件。
+
+## 审查与验证
+
+项目按「工具实现者 / 审查者 / AI 使用方」三视角做了多轮对抗性审查：每条缺陷都先写成
+可复现探针看到红（真实 traceback 或断言失败），再改代码到绿，最后把等价断言固化进测试。
+
+| 层 | 规模 | 说明 |
+|---|---|---|
+| 无头测试 | **176 项** | 边界 61 + IPv6 报文 58 + 守护 21 + 哨兵 11 + 限速 6 + GUI 冒烟 19 |
+| 真机自检 | **51 项** | 真实窗口 + 真实扫描 + 幽灵设备端到端（含限速/守护演练/哨兵/换网中止） |
+| 清单兜底 | 17 项 | 编译、红线、安全不变量、dry-run 纯净、版本一致、文档计数与实跑一致 |
+
+> CI 会跑全部无头测试（含 GUI 冒烟）再构建三产物；打 tag 前还会校验 tag 与 versions.json 一致。
 
 ---
 
@@ -412,7 +425,8 @@ WiFi-Kill/
 ├── build.py              一键构建 + 版本自增 + 文档版本同步与校验
 ├── versions.json         版本真源
 ├── selftest.py           GUI 端到端自检（51 项）
-├── tests/test_edge.py    边界与故障路径测试（52 项）
+├── tests/test_edge.py    边界与故障路径测试（61 项）
+├── tests/test_gui_smoke.py GUI 冒烟测试（19 项，CI 可跑，不发包）
 ├── tests/test_ipv6.py    IPv6 报文级测试（58 项，CI 可跑）
 ├── tests/test_guard.py   本机守护单元测试（21 项，CI 可跑）
 ├── tests/test_sentinel.py 全网哨兵单元测试（11 项，CI 可跑）
@@ -432,11 +446,12 @@ WiFi-Kill/
 
 ```bash
 # 五套无头测试（不发包，CI 也跑）
-python tests/test_edge.py       # 边界与故障路径 52 项
+python tests/test_edge.py       # 边界与故障路径 61 项
 python tests/test_ipv6.py       # IPv6 报文级 58 项
 python tests/test_guard.py      # 本机守护 21 项
 python tests/test_sentinel.py   # 全网哨兵 11 项
 python tests/test_throttle.py   # 占空比限速 6 项
+python tests/test_gui_smoke.py  # GUI 冒烟 19 项（不发包，CI 也跑）
 
 # 真机 GUI 端到端自检（驱动真实窗口，注入一台“幽灵设备”，不影响任何人）
 python selftest.py              # 51 项
@@ -456,9 +471,9 @@ README 与两份手册一起发到 Releases。若 tag 与 `versions.json` 不一
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.6.2** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.6.2 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.6.2 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.6.3** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.6.3 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.6.3 | 面向开发者，含报文结构、线程模型、测试与打包 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增（`--bump patch|minor|major`），程序与两份手册的版本
