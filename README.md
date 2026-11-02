@@ -7,7 +7,7 @@
 **局域网设备发现与 ARP 阻断工具**
 Windows GUI · 单文件免安装 · 不依赖手机 ROOT · 莫兰迪自绘界面
 
-<img src="https://img.shields.io/badge/version-v2.5.0-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.6.0-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4" alt="platform">
 <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="python">
 <img src="https://img.shields.io/badge/license-仅供学习研究-6B7280" alt="license">
@@ -87,6 +87,7 @@ WiFiKill 是一个 Windows 桌面程序，能列出同一局域网里的所有�
 | 🔗 IPv6 定向阻断 | 实验功能：对**多个目标并发**做 NDP 投毒，切断经网关的出站流量（v2.4.0 起支持多目标） |
 | 🛡️ 本机主动防御 | 守护本机：即使不主动阻断任何人，也持续核对并纠正网关真实 MAC，自动抵御外部 ARP/NDP 投毒 |
 | 🗡️ 全网 ARP 哨兵 | 设备基线库：新设备上线立即告警（托盘气泡），投毒者 MAC 指认，事件流留痕可查（v2.5.0） |
+| 🐢 占空比限速 | 右键对已阻断设备设 80%/50%/20% 在线占空比：断断通通、体感卡顿而非全断（v2.6.0，ARP 层的诚实做法） |
 | 🔓 管理员自启动 | 登录时以管理员身份自动启动并最小化到托盘（注册表 Run 键 + UAC 清单） |
 | ☑️ IPv4/IPv6 多选 | IPv4 早已支持批量；v2.4.0 起 IPv6 也支持多选 + 全选 / 反选 |
 | 🎨 自绘界面 | 莫兰迪配色、圆角卡片、10 类动效、多尺寸自绘图标，零第三方 UI 库 |
@@ -183,6 +184,16 @@ ARP 是纯 IPv4 协议。现在国内宽带普遍下发全局 IPv6（RA + SLAAC�
 
 > 与 SoftPerfect WiFi Guard 的「新设备告警」和 arpwatch 的「基线告警」同类，
 > 但与守护、阻断闭环在同一个工具里，且全部离线免费。
+
+### 占空比限速 · v2.6.0 新增
+
+ARP 层**做不了真限速**（NetCut 的限速依赖网关配合）。WiFiKill 的诚实做法是
+**占空比节流**：10 拍一轮，按比例发投毒帧（断）和恢复帧（通）——
+
+- 右键已阻断设备 → 限速 80% / 50% / 20%（重度）/ 取消限速（回到全断）
+- duty=50 → 约一半时间能通，体感「一直转圈」，但没被彻底踢下线
+- 状态列实时显示「限速 50%」；占空比随阻断状态落盘，崩溃恢复后保持
+- 边界：目标侧 ARP 缓存刷新很快时效果会打折；IPv6 侧不受占空比影响（仍按 IPv6 开关全断/放行）
 
 ---
 
@@ -355,7 +366,7 @@ python -m venv .buildenv
 
 | # | 场景 | 操作 | 结果 |
 |---|---|---|---|
-| 1 | 宿舍里有人 24 小时挂机下载，全楼卡顿 | 扫描 → 找到跑满带宽那台 → 阻断选中 | 它掉网，其他人恢复 |
+| 1 | 宿舍里有人 24 小时挂机下载，全楼卡顿 | 扫描 → 找到跑满带宽那台 → 阻断后右键「限速 50%」 | 它卡到怀疑人生但没被踢，其余人恢复 |
 | 2 | 想知道家里到底连了多少设备 | 打开程序等扫描完成 | 页脚徽章显示「在线 N」 |
 | 3 | 发现一个不认识的设备在蹭网 | 记下它的 MAC → 阻断 → 去路由器拉黑 | 先止血，再彻底解决 |
 | 4 | 担心有人在网内搞 ARP 投毒 | 点「守护本机」开启主动防御 | 缓存被篡改自动纠正，页脚显示「守护中·纠正 N」 |
@@ -420,9 +431,9 @@ A：PyInstaller 单文件 + 网络扫描是常见误报特征。源码在仓库�
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.5.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.5.0 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.5.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.6.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.6.0 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.6.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增（`--bump patch|minor|major`），文档版本随构建同步。
@@ -445,6 +456,7 @@ WiFi-Kill/
 ├── tests/test_ipv6.py    IPv6 报文级测试（58 项，CI 可跑）
 ├── tests/test_guard.py   本机守护单元测试（21 项，CI 可跑）
 ├── tests/test_sentinel.py 全网哨兵单元测试（10 项，CI 可跑）
+├── tests/test_throttle.py 占空比限速单元测试（6 项，CI 可跑）
 ├── tools/
 │   ├── make_images.py    概念图生成
 │   └── make_icon.py      多尺寸图标生成（16–256px 分级绘制）

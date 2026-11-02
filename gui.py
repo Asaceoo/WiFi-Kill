@@ -811,8 +811,14 @@ class App(tk.Tk):
 
     def _state_of(self, d: core.Device) -> tuple[str, str]:
         """状态列：这台设备「正被怎样对待」。"""
-        v4 = bool(self._killer and any(t.ip == d.ip for t in self._killer.targets()))
+        duty = self._killer.duty_of(d.ip) if self._killer else None
+        v4 = duty is not None
         v6 = self._ndp_mgr.state_of(d.ip) if self._ndp_on else ""
+        if v4 and 0 < (duty or 100) < 100:
+            state = f"限速 {duty}%"
+            if v6 == "ok":
+                state += "·v6全断"
+            return state, "blocked"
         if v4 and v6 == "ok":
             return "阻断中·双栈", "blocked"
         if v4 and v6 == "miss":
@@ -824,6 +830,21 @@ class App(tk.Tk):
         if v6 == "miss":
             return "仅v4·未探明", "v4only"
         return "未阻断", ""
+
+    def _set_duty(self, duty: int):
+        """对选中的已阻断设备调整占空比（占空比限速）。"""
+        if not self._killer:
+            messagebox.showinfo("限速", "当前没有阻断中的目标。", parent=self)
+            return
+        picked = [ip for ip in self.tree.selection()]
+        done = [self._killer.set_duty(ip, duty) for ip in picked]
+        n = sum(1 for ok in done if ok)
+        if n:
+            self.log(f"已对 {n} 台设备设置占空比 {duty}%", "ok")
+            self._render_rows()
+            self._update_buttons()
+        else:
+            messagebox.showinfo("限速", "选中的设备不在阻断队列（先阻断再限速）。", parent=self)
 
     def _render_rows(self, animate: bool = False):
         """重画设备表。
@@ -1232,6 +1253,11 @@ class App(tk.Tk):
         self.menu.delete(0, "end")
         self.menu.add_command(label="阻断选中", command=lambda: self.do_block(False))
         self.menu.add_command(label="放行选中", command=self._unblock_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="限速 80%（轻度）", command=lambda: self._set_duty(80))
+        self.menu.add_command(label="限速 50%", command=lambda: self._set_duty(50))
+        self.menu.add_command(label="限速 20%（重度）", command=lambda: self._set_duty(20))
+        self.menu.add_command(label="取消限速（恢复全断）", command=lambda: self._set_duty(100))
         self.menu.add_separator()
         self.menu.add_command(label="加入白名单", command=lambda: self._wl(True))
         self.menu.add_command(label="移出白名单", command=lambda: self._wl(False))

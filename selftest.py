@@ -168,6 +168,14 @@ def run():
             rows = app.tree.item("192.168.1.250")["values"]
             check("行状态=阻断中", "阻断中" in [str(x) for x in rows], str(rows))
             check("放行按钮已启用", app.btn_free.enabled)
+            # --- 占空比限速（v2.6.0）---
+            app._killer.set_duty("192.168.1.250", 50)
+            check("限速占空比生效", app._killer.duty_of("192.168.1.250") == 50)
+            _d = type("D", (), {"ip": "192.168.1.250"})
+            state, _tag = app._state_of(_d())
+            check("状态列显示限速", "限速 50%" in state, state)
+            app._killer.set_duty("192.168.1.250", 100)
+            check("取消限速回到全断", app._killer.duty_of("192.168.1.250") == 100)
             snap(app, "t2_blocked.png")
         except Exception:
             check("s3", False, traceback.format_exc()[-300:])

