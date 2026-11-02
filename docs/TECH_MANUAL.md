@@ -1,6 +1,6 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.6.0** · 对应程序：**v2.6.0** · 更新日期：2026-11-02
+> 文档版本：**v1.6.1** · 对应程序：**v2.6.1** · 更新日期：2026-11-02
 
 ---
 
@@ -202,6 +202,36 @@ Tk 动画最经典的死法是：窗口销毁后 `after` 回调继续触发，�
 
 状态通过 `Guard.status()` 暴露（active / 网关基准 / 异常计数 / 上次动作），GUI 页脚「守护中」徽章据此显示，
 检测到投毒时自动纠正并写日志告警。
+
+### 2.8 全网 ARP 哨兵（Sentinel）· v2.5.0 新增
+
+`core.Sentinel` 管「全楼名册」，与 Guard（管网关映射）分工：
+
+- **基线半自动**：首次 `feed_scan` 把扫描结果静默入册（`known=True`，视为现任住户，
+  避免"开门全楼告警"轰炸）；之后新 MAC 入册为 `known=False` 并产生 `new` 事件，
+  由用户 `claim()`（认领）或 `forget()`（移出，下次出现再告警）。
+- **事件流**：`events` 最近 200 条（`SENTINEL_MAX_EVENTS`），随基线落盘 `sentinel.json`
+  （原子写，损坏即按空基线重建）。
+- **通知去重**：`_notify_dedup(key)` 同一事件 key 5 分钟内只弹一次
+  （`NOTIFY_DEDUP_SECONDS`），防持续攻击轰炸；`notify` 回调由 GUI 注入
+  （`TrayIcon.notify` 气泡），未注入只记 LOG —— 无头测试安全。
+- **投毒者指认**：Guard 漂移确认后 `_hunt_poisoner` 单飞启动 `sniff_poisoner`
+  （4 秒嗅探），抓「`psrc == 网关IP` 且 `hwsrc/eth.src ≠ 真实网关 MAC`」的帧，
+  取其以太网源 MAC。**指认结论必须带「疑似/可伪造」限定**——以太网源 MAC 可被
+  攻击者冒用无辜设备，不能写成定罪式断言（对抗性审查 F2）。
+
+### 2.9 占空比限速 · v2.6.0 新增
+
+ARP 层做不了真限速（NetCut 的限速依赖网关配合）。WiFiKill 的诚实做法是**占空比节流**：
+
+- `Target.duty`（10–100）：100 = 恒投毒（全断，默认）；`_should_poison(t, cycle_idx)`
+  在 10 拍周期（`_THROTTLE_CYCLE`）里阻断 `round(duty/10)` 拍，其余拍发**恢复帧**
+  让目标与网关的缓存回填（目标间歇可上网 = 体感限速）。
+- `set_duty` / `duty_of` API；`duty` 进 `asdict()` 随状态落盘，**崩溃恢复路径必须
+  读回 `it.get("duty")`**（gui `_restore_from_state`，对抗性审查 F1——漏读会让
+  限速目标重启后静默变回全断，与文档承诺矛盾）。
+- 边界：IPv6 侧不受 duty 影响（仍按 IPv6 阻断开关全断/放行）；恢复拍与阻断拍的
+  交替会让网络中 ARP 帧量比全断时多约一倍——这是设计代价，不是 bug。
 
 ---
 
@@ -498,7 +528,7 @@ Npcap 安装时的选项决定了普通用户能否发帧。以 admin 作为门�
 | 双栈判定 | 只有 `/128` 主机路由时不算双栈 |
 | MAC 校验 | 大小写、短写、非十六进制 |
 
-### 11.3 GUI 自检 `selftest.py`（28 项）
+### 11.3 GUI 自检 `selftest.py`（46 项）
 
 开头会**备份并清空** `whitelist.txt` 与 `.wifikill-state.json`，结束时恢复——
 否则上一轮中断残留的文件会让断言结果取决于"上次跑到哪一步"。这是实测踩过的坑：
@@ -586,6 +616,32 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 | `dry_run_skips_local_arp_clear` | 演练模式绝不动本机真实缓存 |
 | `v6_drift_clears_local_neighbor` | IPv6 漂移时 best-effort 删除本机邻居条目（netsh 需提权） |
 
+### 11.7 哨兵单元测试 `tests/test_sentinel.py`（10 项）
+
+| 用例 | 断言 |
+|---|---|
+| `first_run_silent_baseline` | 首次运行全楼静默入册，不告警 |
+| `new_device_alerts` | 新 MAC 出现 → new 事件 + 通知 + 待认领 |
+| `notify_dedup_5min` | 同事件 key 5 分钟内只弹一次 |
+| `claim_and_forget` | 认领闭环；移出后重新告警 |
+| `persistence` | 基线与事件落盘，新实例恢复 |
+| `events_cap` | 事件流 200 条截断 |
+| `sniff_poisoner_finds_attacker` | 嗅探过滤逻辑：冒称帧入选、真网关/无关 IP 排除 |
+| `sniff_poisoner_empty_when_clean` | 抓不到如实返回空 |
+| `guard_hunt_reports_poisoner` | 漂移触发指认，事件经 event_sink 含去重 key |
+| `guard_hunt_dry_run_silent` | 演练模式不嗅探 |
+
+### 11.8 占空比限速单元测试 `tests/test_throttle.py`（6 项）
+
+| 用例 | 断言 |
+|---|---|
+| `duty_100_always_poisons` | duty=100 恒阻断 |
+| `duty_50_half_and_half` | duty=50 十拍五断五通，且阻断/恢复拍各自连续 |
+| `duty_10_one_in_ten` | duty=10 周期内 1 拍阻断 |
+| `duty_clamped` | <10 与 >100 钳制 |
+| `set_duty_updates_and_persists` | 更新 + 触发持久化（state 含 duty） |
+| `loop_alternates_poison_and_restore` | 真循环集成：阻断拍与恢复拍交替出现 |
+
 ---
 
 ## 12. 打包与版本管理
@@ -615,7 +671,7 @@ python build.py
 文档里的标记行格式固定，构建脚本靠正则定位：
 
 ```markdown
-> 文档版本：**v1.6.0** · 对应程序：**v2.6.0** · 更新日期：2026-11-02
+> 文档版本：**v1.6.1** · 对应程序：**v2.6.1** · 更新日期：2026-11-02
 ```
 
 ### 12.3 打包参数与取舍

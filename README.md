@@ -7,7 +7,7 @@
 **局域网设备发现与 ARP 阻断工具**
 Windows GUI · 单文件免安装 · 不依赖手机 ROOT · 莫兰迪自绘界面
 
-<img src="https://img.shields.io/badge/version-v2.6.0-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.6.1-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4" alt="platform">
 <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="python">
 <img src="https://img.shields.io/badge/license-仅供学习研究-6B7280" alt="license">
@@ -431,9 +431,9 @@ A：PyInstaller 单文件 + 网络扫描是常见误报特征。源码在仓库�
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.6.0** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.6.0 | 面向使用者，含完整操作步骤与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.6.0 | 面向开发者，含报文结构、线程模型、测试与打包 |
+| 程序 | **v2.6.1** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.6.1 | 面向使用者，含完整操作步骤与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.6.1 | 面向开发者，含报文结构、线程模型、测试与打包 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增（`--bump patch|minor|major`），文档版本随构建同步。

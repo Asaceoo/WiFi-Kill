@@ -719,7 +719,10 @@ class App(tk.Tk):
                 return
             k = core.Killer(ni, dry_run=False)
             for it in items:
-                k._targets[it["ip"]] = core.Target(it["ip"], it["mac"])
+                # 对抗性审查 F1：占空比随状态落盘（v2.6.0），恢复时必须带回来，
+                # 否则崩溃重启后限速目标会静默变回全断。
+                k._targets[it["ip"]] = core.Target(it["ip"], it["mac"],
+                                                   duty=int(it.get("duty", 100)))
             n = k.restore_all()
             self._post(lambda: self.log(f"已恢复 {n} 台设备", "ok"))
             self._post(self.do_scan)

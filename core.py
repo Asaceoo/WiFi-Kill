@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -1143,13 +1143,16 @@ class Guard:
             try:
                 killer_mac = sniff_poisoner(self.ni, gw_ip, gw_mac, seconds=4.0)
                 if killer_mac and self.event_sink:
+                    # 对抗性审查 F2：以太网源 MAC 可被攻击者伪造（冒用无辜设备），
+                    # 指认结论必须带"疑似/供参考"限定，不能写成定罪式断言。
                     self.event_sink(
-                        "poison", f"投毒者已定位：{killer_mac}"
-                                  f"（曾冒称网关 {gw_ip}），已在册跟踪",
+                        "poison", f"疑似投毒者：{killer_mac}"
+                                  f"（曾冒称网关 {gw_ip}；MAC 可伪造，供参考）",
                         mac=killer_mac, ip=gw_ip,
                         notify_key=f"poison:{killer_mac}",
                         notify_title="ARP 投毒已拦截",
-                        notify_msg=f"攻击者 {killer_mac} 冒称网关，已自动纠正并记录")
+                        notify_msg=f"疑似攻击者 {killer_mac} 冒称网关"
+                                   f"（MAC 可伪造，供参考），已自动纠正")
                 elif self.event_sink:
                     self.event_sink(
                         "poison", "检测到网关映射漂移并已纠正，但未能定位投毒者"
