@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -262,14 +262,28 @@ def l2_check() -> tuple[str, str]:
     return "ok", "ok"
 
 
+def _relaunch_command(extra_args: list[str] | None = None,
+                      script: str | None = None) -> tuple[str, str]:
+    """返回 (可执行文件, 参数串)。
+
+    对抗性审查第 8 轮（探针复现）：源码运行时只传 extra_args，参数串是**空**的——
+    UAC 提权后拉起的是一个没有任何脚本的 python.exe（黑框一闪就退），用户等于丢了程序。
+    所以非 frozen 运行时必须把入口脚本路径插到参数最前面。
+    """
+    args = list(extra_args or [])
+    if not getattr(sys, "frozen", False):
+        entry = script or (sys.argv[0] if sys.argv and sys.argv[0].endswith(".py")
+                           else "gui.py")
+        args.insert(0, os.path.abspath(entry))
+    return sys.executable, subprocess.list2cmdline(args)
+
+
 def relaunch_elevated(extra_args: list[str] | None = None) -> bool:
     if not WINDOWS or is_admin():
         return False
     try:
         import ctypes
-        target = sys.executable
-        args = list(extra_args or [])
-        params = subprocess.list2cmdline(args)
+        target, params = _relaunch_command(extra_args)
         rc = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", target, params, None, 1)
         return rc > 32

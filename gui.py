@@ -1156,13 +1156,29 @@ class App(tk.Tk):
         """逐个验证已阻断设备是否真的断网（被动嗅探，不发新包）。"""
         targets = self._killer.targets() if self._killer else []
         if not targets:
+            if self._ndp_mgr.active_ips():
+                # 只有 IPv6 目标时不能说「没有阻断设备」——按钮本来就是亮的。
+                msg = ("当前只有 IPv6 阻断在生效；IPv6 侧的生效判定暂未自动化，"
+                       "可观察该设备是否还能访问外网来确认。")
+                self.log("[验证] " + msg, "warn")
+                messagebox.showinfo("验证断网", msg, parent=self)
+                return
             messagebox.showinfo("验证断网", "当前没有处于阻断状态的设备。", parent=self)
             return
         self._set_busy(True, "正在验证…")
         ni = core.NetInfo(**self._killer.ni.__dict__)
 
         def work():
-            result = core.verify_targets(ni, targets, seconds=4.0)
+            try:
+                result = core.verify_targets(ni, targets, seconds=4.0)
+            except Exception as e:
+                # 嗅探/网卡异常必须把忙碌态放回去，否则按钮永久灰掉（第 8 轮发现）
+                def failed():
+                    self._set_busy(False)
+                    self.log(f"[验证] 验证失败：{e}", "err")
+                    messagebox.showwarning("验证断网", f"验证失败：{e}", parent=self)
+                self._post(failed)
+                return
 
             def done():
                 lines = []
@@ -1214,7 +1230,10 @@ class App(tk.Tk):
             duty = max(10, min(100, int(float(var.get()))))
             ips = sel or [t.ip for t in self._killer.targets()]
             n = sum(1 for ip in ips if self._killer.set_duty(ip, duty))
-            self.log(f"已对 {n} 台设备设置占空比 {duty}%", "ok" if n else "warn")
+            skipped = len(ips) - n
+            self.log(f"已对 {n} 台设备设置占空比 {duty}%"
+                     + (f"（{skipped} 台不在阻断队列，已跳过）" if skipped else ""),
+                     "ok" if n else "warn")
             self._render_rows()
             win.destroy()
 
@@ -1643,11 +1662,30 @@ class App(tk.Tk):
                 f"仍有 {n} 台设备处于阻断状态。\n重启会先恢复它们，然后以管理员身份重新启动。\n\n继续？",
                 parent=self):
             return
+        # 顺序很关键（第 8 轮探针确认）：先恢复阻断 → 释放单实例锁 → 再拉起新实例。
+        # 若反过来，新实例会因为本地端口仍被本进程占用而弹「已在运行」然后退出。
+        try:
+            self._stop_ndp(restore=True)
+            if self._killer:
+                self._killer.restore_all()
+        except Exception:
+            pass
+        try:
+            self._lock_holder.release()
+        except Exception:
+            pass
         if not core.relaunch_elevated([]):
+            try:
+                self._lock_holder.acquire()     # 提权取消：把锁拿回来继续用当前实例
+            except Exception:
+                pass
             messagebox.showwarning(
                 "以管理员身份重启",
                 "未能启动提权实例（可能取消了 UAC 弹窗，或当前平台不支持）。\n"
-                "也可以手动右键 exe →「以管理员身份运行」。", parent=self)
+                "已恢复全部阻断，可继续在当前实例里操作；也可以手动右键 exe →「以管理员身份运行」。",
+                parent=self)
+            self._render_rows()
+            self._update_buttons()
             return
         self.log("正在以管理员身份重启…", "info")
         self._quit(ask=False)

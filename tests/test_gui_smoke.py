@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -130,6 +131,51 @@ def main() -> int:
         except Exception:
             check("s2 冒烟步骤", False, traceback.format_exc()[-300:])
 
+    def s3():
+        """第 8 轮回归：验证失败必须放回忙碌态；只有 IPv6 目标时提示要诚实。"""
+        try:
+            import core as _c
+            real_verify = _c.verify_targets
+
+            def boom(*_a, **_kw):
+                raise RuntimeError("simulated sniff failure")
+
+            app._killer = _c.Killer(app._net, dry_run=True)
+            app._killer._targets["10.9.9.9"] = _c.Target("10.9.9.9", "02:00:00:00:00:09")
+            _c.verify_targets = boom
+            app.do_verify()
+            for _ in range(40):
+                app.update()
+                if not app._busy:
+                    break
+                time.sleep(0.05)
+            check("验证异常后不会卡在忙碌态", app._busy is False)
+            _c.verify_targets = real_verify
+
+            # 只有 IPv6 目标时：按钮亮着，提示必须说明 IPv6 侧未自动化
+            app._killer._targets.clear()
+
+            class _FakeV6:
+                def active_ips(self):
+                    return ["192.168.1.251"]
+                def state_of(self, ip):
+                    return ""
+
+            real_mgr, app._ndp_mgr = app._ndp_mgr, _FakeV6()
+            shown = []
+            import tkinter.messagebox as mb
+            real_info = mb.showinfo
+            mb.showinfo = lambda *a, **k: shown.append(a)
+            try:
+                app.do_verify()
+            finally:
+                mb.showinfo = real_info
+                app._ndp_mgr = real_mgr
+            text = " ".join(str(x) for x in (shown[0] if shown else ()))
+            check("仅有 IPv6 目标时提示说明未自动化", "IPv6" in text, text[:80])
+        except Exception:
+            check("s3 回归步骤", False, traceback.format_exc()[-300:])
+
     def finish():
         try:
             if getattr(app, "_destroyed", False):
@@ -148,7 +194,7 @@ def main() -> int:
         if done or deadline[0] <= 0:
             # 单线串行：s1 → s2 → finish，避免两个定时器并发把窗口提前销毁
             s1()
-            app.after(300, lambda: (s2(), app.after(300, finish)))
+            app.after(300, lambda: (s2(), app.after(300, lambda: (s3(), app.after(400, finish)))))
             return
         deadline[0] -= 250
         app.after(250, lambda: watch(deadline))

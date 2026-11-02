@@ -452,6 +452,30 @@ def t_restore_frames_come_last():
 
 
 @case
+def t_relaunch_command_keeps_entry_script():
+    """以管理员身份重启：源码运行必须带上入口脚本，否则拉起的是空 python.exe。
+
+    第 8 轮探针：修复前 params 为空串（提权后黑框一闪就退，用户丢掉程序）。
+    """
+    target, params = core._relaunch_command([], script="gui.py")
+    check("源码运行时参数里带入口脚本", params.strip().endswith("gui.py"), params)
+    check("可执行文件是当前解释器", bool(target), target)
+    _, p2 = core._relaunch_command(["--minimized"], script="gui.py")
+    check("额外参数保留", "gui.py" in p2 and "--minimized" in p2, p2)
+    had = hasattr(sys, "frozen")
+    old = getattr(sys, "frozen", False)
+    try:
+        sys.frozen = True
+        _, p3 = core._relaunch_command([])
+        check("打包运行时不注入脚本路径", ".py" not in p3, p3)
+    finally:
+        if had:
+            sys.frozen = old
+        else:
+            delattr(sys, "frozen")
+
+
+@case
 def t_verification_verdict():
     """阻断验证的判据（纯函数）：吸到本机=生效，仍走真实网关=泄漏。"""
     ok = core.verification_verdict(5, 0)
@@ -500,7 +524,8 @@ def main():
                t_network_change_abandons,
                # 第 7 轮：发送顺序 / 邻居表转换
                t_stale_generation_refuses_send, t_restore_frames_come_last,
-               t_arp_row_conversion, t_verification_verdict):
+               t_arp_row_conversion, t_verification_verdict,
+               t_relaunch_command_keeps_entry_script):
         fn()
 
     print("\n=========== 边界测试 ===========")
