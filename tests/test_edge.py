@@ -525,22 +525,34 @@ def t_arp_row_conversion():
 @case
 def t_hostname_parsers():
     """设备名识别（第 12 轮）：mDNS / LLMNR / NBSN / DHCP 报文的纯函数解析。"""
-    from scapy.layers.dns import DNS, DNSQR
+    from scapy.layers.dns import DNS, DNSQR, DNSRR
     from scapy.layers.l2 import Ether
     from scapy.layers.inet import IP, UDP
 
+    # 只有「应答/公告」（qr=1）才代表发送者的身份；查询（qr=0）在下面单独断言
     mdns = (Ether(src="aa:bb:cc:dd:ee:01") / IP() / UDP()
-            / DNS(qd=DNSQR(qname="macbook-pro.local")))
+            / DNS(qr=1, an=DNSRR(rrname="macbook-pro.local", rdata="10.0.0.1")))
     llmnr = (Ether(src="aa:bb:cc:dd:ee:02") / IP() / UDP()
-             / DNS(qd=DNSQR(qname="DESKTOP-ABC")))
+             / DNS(qr=1, an=DNSRR(rrname="DESKTOP-ABC", rdata="10.0.0.2")))
     svc = (Ether(src="aa:bb:cc:dd:ee:03") / IP() / UDP()
-           / DNS(qd=DNSQR(qname="_airplay._tcp.local")))
-    check("mDNS 去掉 .local 后缀",
+           / DNS(qr=1, an=DNSRR(rrname="_airplay._tcp.local", rdata="10.0.0.3")))
+    check("mDNS 应答去 .local 后缀",
           core.name_from_dns_packet(mdns) == "macbook-pro", core.name_from_dns_packet(mdns))
-    check("LLMNR 原样返回",
+    check("LLMNR 应答原样返回",
           core.name_from_dns_packet(llmnr) == "DESKTOP-ABC", core.name_from_dns_packet(llmnr))
     check("服务名（下划线开头）不当主机名",
           core.name_from_dns_packet(svc) == "", core.name_from_dns_packet(svc))
+    # 第 12 轮：查询报文（qr=0）里的 qname 是「他在找谁」，不能当成发送者的名字
+    from scapy.layers.dns import DNSRR
+    query = (Ether(src="aa:bb:cc:dd:ee:0a") / IP() / UDP()
+             / DNS(qr=0, qd=DNSQR(qname="apple-tv.local")))
+    answer = (Ether(src="aa:bb:cc:dd:ee:0b") / IP() / UDP()
+              / DNS(qr=1, an=DNSRR(rrname="macbook.local", rdata="10.0.0.11")))
+    check("查询报文不取名（防张冠李戴）",
+          core.hostname_from_packet(query) == ("", ""), str(core.hostname_from_packet(query)))
+    got_mac, got_name = core.hostname_from_packet(answer)
+    check("应答报文取名", got_name == "macbook" and got_mac == "aa:bb:cc:dd:ee:0b",
+          f"{got_mac} {got_name}")
     mac, name = core.hostname_from_packet(mdns)
     check("从报文取到 (mac, name)",
           mac == "aa:bb:cc:dd:ee:01" and name == "macbook-pro", f"{mac} {name}")
@@ -581,10 +593,18 @@ def t_export_devices_and_events():
             core.Device(ip="10.0.0.6", mac="aa:bb:cc:dd:ee:06")]
     csv_path = tmp / "d.csv"
     n = core.export_devices(devs, csv_path,
-                            state_of=lambda d: "阻断中" if d.ip.endswith("5") else "未阻断")
+                            state_of=lambda d: "阻断中" if d.ip.endswith("5") else "未阻断",
+                            mark_of=lambda d: d.host or d.note,
+                            alias_of=lambda d: "我起的名字" if d.ip.endswith("5") else "")
     text = csv_path.read_text(encoding="utf-8-sig")
     check("CSV 行数与表头正确", n == 2 and "IP,MAC" in text, str(n))
     check("CSV 含主机名与状态", "macbook" in text and "阻断中" in text)
+    # 第 12 轮：角色 / 标识 / 状态 / 备注 四列各归其位（此前「备注」取不存在的 d.alias 恒为空）
+    head, row5 = text.strip().splitlines()[0], text.strip().splitlines()[1]
+    cols = dict(zip(head.split(","), row5.split(",")))
+    check("角色列 = Device.note", cols.get("角色") == "同学", str(cols.get("角色")))
+    check("标识列 = mark_of", cols.get("标识") == "macbook", str(cols.get("标识")))
+    check("备注列 = 用户起的名字", cols.get("备注") == "我起的名字", str(cols.get("备注")))
 
     json_path = tmp / "d.json"
     core.export_devices(devs, json_path)

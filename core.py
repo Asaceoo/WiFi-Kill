@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -1826,20 +1826,26 @@ HOSTNAME_BPF = "udp port 5353 or udp port 5355 or udp port 137 or udp port 68"
 
 
 def name_from_dns_packet(pkt) -> str:
-    """从 mDNS / LLMNR 的 DNS 报文里取一个主机名（纯函数，便于单测）。
+    """从 mDNS / LLMNR 的**应答**里取一个主机名（纯函数，便于单测）。
 
-    mDNS 与 LLMNR 都是 DNS 报文格式，取第一个「看起来像主机名」的记录：
-    去掉 .local 后缀与 _service 这类服务名。
+    对抗性审查第 12 轮（探针复现）：查询报文里的 qname 是「他在找谁」，不是「他是谁」——
+    照旧取用会把 apple-tv 的名字安到正在询问它的手机上（张冠李戴）。因此：
+
+    - qr=0（查询）一律不取名：宁可少识别，也不认错；
+    - qr=1（应答 / 公告）只看 an / ns / ar 的 rrname，不看 qd（应答的 qd 是「被问的问题」）；
+    - 去掉 .local 后缀，跳过 _service 这类服务名。
     """
     try:
         from scapy.layers.dns import DNS
         if not pkt.haslayer(DNS):
             return ""
         dns = pkt[DNS]
+        if int(getattr(dns, "qr", 0) or 0) != 1:
+            return ""
     except Exception:
         return ""
     names: list[str] = []
-    for attr in ("qd", "an", "ns", "ar"):
+    for attr in ("an", "ns", "ar"):
         section = getattr(dns, attr, None)
         if not section:
             continue
@@ -1967,19 +1973,22 @@ def reverse_dns_names(ips, timeout: float = 0.6, limit: int = 64) -> dict[str, s
 # ---------------------------------------------------------------- 导出
 
 
-def export_devices_csv(devices, path, state_of=None) -> int:
+def export_devices_csv(devices, path, state_of=None, mark_of=None, alias_of=None) -> int:
     """把设备清单写成 CSV（utf-8-sig，Excel 直接打开不乱码）。返回行数。"""
     import csv as _csv
     rows = 0
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = _csv.writer(f)
-        w.writerow(["IP", "MAC", "主机名", "厂商", "类型", "标识", "状态", "备注"])
+        w.writerow(["IP", "MAC", "主机名", "厂商", "类型", "角色", "标识", "状态", "备注"])
         for d in devices:
             state = state_of(d) if callable(state_of) else getattr(d, "state", "")
-            w.writerow([getattr(d, "ip", ""), getattr(d, "mac", ""),
-                        getattr(d, "host", ""), getattr(d, "vendor", ""),
-                        getattr(d, "dtype", ""), getattr(d, "note", ""),
-                        state, getattr(d, "alias", "")])
+            role = getattr(d, "note", "")
+            host = getattr(d, "host", "")
+            mark = mark_of(d) if callable(mark_of) else (host or role)
+            alias = alias_of(d) if callable(alias_of) else ""
+            w.writerow([getattr(d, "ip", ""), getattr(d, "mac", ""), host,
+                        getattr(d, "vendor", ""), getattr(d, "dtype", ""),
+                        role, mark, state, alias])
             rows += 1
     return rows
 
@@ -1992,11 +2001,12 @@ def export_json(payload: dict, path) -> None:
     os.replace(tmp, p)
 
 
-def export_devices(devices, path, ni: "NetInfo" | None = None, state_of=None) -> int:
+def export_devices(devices, path, ni: "NetInfo" | None = None, state_of=None,
+                   mark_of=None, alias_of=None) -> int:
     """按扩展名导出设备清单：.csv 或 .json。返回条目数。"""
     p = Path(path)
     if p.suffix.lower() == ".csv":
-        return export_devices_csv(devices, p, state_of)
+        return export_devices_csv(devices, p, state_of, mark_of, alias_of)
     export_json({
         "exported": time.time(),
         "kind": "devices",
@@ -2013,6 +2023,9 @@ def export_devices(devices, path, ni: "NetInfo" | None = None, state_of=None) ->
             "vendor": getattr(d, "vendor", ""),
             "dtype": getattr(d, "dtype", ""),
             "note": getattr(d, "note", ""),
+            "mark": (mark_of(d) if callable(mark_of)
+                     else (getattr(d, "host", "") or getattr(d, "note", ""))),
+            "alias": (alias_of(d) if callable(alias_of) else ""),
             "state": (state_of(d) if callable(state_of) else getattr(d, "state", "")),
         } for d in devices],
     }, p)

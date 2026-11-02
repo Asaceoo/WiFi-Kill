@@ -75,6 +75,7 @@ class App(tk.Tk):
         self._filter = ""
         self._sort_key = None
         self._sort_rev = False
+        self._updating_search = False
         self._ndp_on = False              # IPv6 阻断开关，默认关（两道门之一）
         self._v6env = None                # ipv6.V6Env，扫描后探测
         import ipv6 as _v6mod
@@ -353,8 +354,11 @@ class App(tk.Tk):
         cv.tag_bind("wlt", "<Leave>", lambda e: cv.configure(cursor=""))
         # 搜索框：过滤 IP / MAC / 主机名 / 厂商 / 标识 / 备注
         self._search.place(x=tx0 - 12 - 220, y=ty + 8, width=220, height=26)
-        self._search.delete(0, "end")
-        self._search.insert(0, self._filter)
+        if self._search.get() != self._filter:   # 只在内容真变了才写回：
+            self._updating_search = True         # 否则每次窗口重排都会重设光标并触发一次过滤
+            self._search.delete(0, "end")
+            self._search.insert(0, self._filter)
+            self._updating_search = False
 
         self._shimmer.y, self._shimmer.x0, self._shimmer.x1 = ty + 52, P, w - P
         if self._busy:
@@ -1397,6 +1401,8 @@ class App(tk.Tk):
         return items
 
     def _on_filter_change(self, *_a):
+        if getattr(self, "_updating_search", False):
+            return
         self._filter = self._search_var.get()
         self._render_rows()
 
@@ -1412,8 +1418,12 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            n = core.export_devices(self._devices, path,
-                                    ni=self._net, state_of=lambda d: self._state_of(d)[0])
+            n = core.export_devices(
+                self._devices, path, ni=self._net,
+                state_of=lambda d: self._state_of(d)[0],
+                mark_of=self._mark_of,
+                alias_of=lambda d: (self._aliases.get(d.mac)
+                                    or self._aliases.get(d.ip) or ""))
             self.log(f"已导出 {n} 台设备清单：{os.path.basename(path)}", "ok")
         except Exception as e:
             self.log(f"导出失败：{e}", "err")

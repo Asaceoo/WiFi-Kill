@@ -1,6 +1,6 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.8.0** · 对应程序：**v2.8.0** · 更新日期：2026-11-02
+> 文档版本：**v1.8.1** · 对应程序：**v2.8.1** · 更新日期：2026-11-02
 
 面向**开发者**：模块边界、报文、线程、状态机、安全护栏、测试体系与发布流水线。
 使用者请看 [USER_MANUAL.md](USER_MANUAL.md)。
@@ -101,7 +101,8 @@ DHCP 68，把 MAC 映射到主机名。四类解析器都是纯函数，可无�
 
 | 函数 | 输入 | 输出 |
 |---|---|---|
-| `name_from_dns_packet` | mDNS / LLMNR（DNS 报文） | 首个非 `_service` 记录，去掉 `.local` |
+| `name_from_dns_packet` | mDNS / LLMNR 的**应答**（qr=1） | an/ns/ar 里首个非 `_service` 记录，去掉 `.local`；
+  **查询（qr=0）一律返回空**——查询里的 qname 是「他在找谁」，当成发送者身份会张冠李戴（第 12 轮修复） |
 | `name_from_nbns_packet` | NetBIOS 名称查询 | QName |
 | `name_from_dhcp_packet` | DHCP | hostname 选项 |
 | `hostname_from_packet` | 任意报文 | `(src_mac, name)`，源 MAC 非法即弃 |
@@ -278,16 +279,16 @@ IDLE ──add()──► ARMED ──start()──► ACTIVE ⇄ (duty<100) THR
 
 ## 11. 测试体系
 
-### 11.1 六套无头测试（226 项，CI 可跑）
+### 11.1 六套无头测试（233 项，CI 可跑）
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/test_edge.py` | 87 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5–10 轮回归 |
+| `tests/test_edge.py` | 92 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5–10 轮回归 |
 | `tests/test_ipv6.py` | 65 | 报文级：NA 结构、组播保险、preflight、mDNS、邻居表解析 |
 | `tests/test_guard.py` | 21 | 守护：基准建立/重估/去抖/自愈/演练纯净 |
 | `tests/test_sentinel.py` | 12 | 哨兵：基线、告警、去重、认领/移出、事件上限、损坏自愈 |
 | `tests/test_throttle.py` | 6 | 占空比：档位、钳制、持久化、真循环交替 |
-| `tests/test_gui_smoke.py` | 35 | 真实建窗 + 扫描渲染 + 新功能入口 + `ui` 常量静态校验（不发包，进 CI） |
+| `tests/test_gui_smoke.py` | 37 | 真实建窗 + 扫描渲染 + 新功能入口 + `ui` 常量静态校验（不发包，进 CI） |
 
 ### 11.2 真机 GUI 端到端（`selftest.py`，51 项）
 
@@ -350,7 +351,9 @@ gitignore 覆盖、文档计数与实跑一致、`ui` 常量存在），任一�
 7. **嗅探定位非定罪**：以太网源 MAC 可被冒用，指认结论标注「疑似」；
 8. **客户端隔离无法绕过**；
 9. **设备名识别受设备行为限制**：只认 mDNS/LLMNR/NBNS/DHCP 广播，隐私模式下手机常不回，只能人工备注；
-10. 非 Windows 分支未验证。
+10. **主机名只来自应答**：安静的设备（不主动公告名字）识别不到，宁可留空也不猜；
+11. **导出列语义固定**：角色 = `Device.note`（网关/本机），标识 = 界面那一列，备注 = 用户起的名字；
+12. 非 Windows 分支未验证。
 
 ## 14. 扩展点
 

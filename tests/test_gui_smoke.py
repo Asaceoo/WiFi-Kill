@@ -130,6 +130,19 @@ def main() -> int:
                 app._sort_by(col)
             app.update()
             check("点表头排序不抛异常", True)
+            # 第 12 轮：窗口重排不得重写搜索框内容（否则光标跳尾 + 多余过滤）
+            app._search_var.set("192.168")
+            app.update()
+            keep = app._search_var.get()
+            before_renders = app._row_gen
+            app._relayout(app._geo["w"], app._geo["h"])
+            app.update()
+            check("重排后搜索词保持不变",
+                  app._search_var.get() == keep, f"{keep!r} -> {app._search_var.get()!r}")
+            check("重排不触发多余过滤重画",
+                  app._row_gen == before_renders, f"{before_renders} -> {app._row_gen}")
+            app._search_var.set("")
+            app.update()
             check("验证按钮默认禁用（无阻断时）", app.btn_verify.enabled is False)
         except Exception:
             check("s1 冒烟步骤", False, traceback.format_exc()[-300:])
