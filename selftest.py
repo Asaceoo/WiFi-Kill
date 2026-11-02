@@ -78,7 +78,7 @@ STATE_BACKUP: list[tuple[Path, bytes | None]] = []
 def isolate_state():
     """把外部状态文件挪开：上一轮中断残留的 whitelist.txt 会让断言结果
     取决于"上次跑到哪一步"，这是实测踩过的坑。"""
-    for f in (core.WHITELIST_FILE, core.STATE_FILE):
+    for f in (core.WHITELIST_FILE, core.STATE_FILE, core.GUARD_FILE):
         try:
             STATE_BACKUP.append((f, f.read_bytes() if f.exists() else None))
             f.unlink(missing_ok=True)
@@ -227,6 +227,38 @@ def run():
         except Exception:
             check("s6b", False, traceback.format_exc()[-300:])
 
+    # 6.7 多选 + 本机守护（演练模式：dry_run 只记录不发包，真机安全）
+    def s6c():
+        try:
+            # --- 全选 / 反选 ---
+            n_rows = len(app.tree.get_children())
+            app.btn_sel_all.command()
+            check("全选生效", len(app.tree.selection()) == n_rows,
+                  f"{len(app.tree.selection())}/{n_rows}")
+            app.btn_sel_inv.command()      # 全选状态下反选 → 全部取消
+            check("反选(全选→清空)", len(app.tree.selection()) == 0)
+            app.btn_sel_inv.command()      # 再反选 → 恢复全选
+            check("反选(清空→全选)", len(app.tree.selection()) == n_rows)
+            app.tree.selection_remove(*app.tree.selection())
+            # --- 本机守护（演练）---
+            check("守护按钮存在", hasattr(app, "btn_guard") and app.btn_guard.enabled)
+            app._opts = (app._opts[0], True)   # 演练模式：dry_run，绝不发真实包
+            app._toggle_guard()                # 走真实开关路径开启（含持久化）
+            app.update()
+            check("守护可开启(演练)", app._guard.is_active())
+            check("守护演练模式生效", app._guard.dry_run is True)
+            check("守护按钮文字=守护中", app.btn_guard.text == "守护中", app.btn_guard.text)
+            app._draw_chips()
+            check("状态徽章含守护中", bool(app._chip_vals) and bool(app._chip_vals[3]))
+            check("守护开关已持久化", core.guard_enabled() is True)
+            app._toggle_guard()                # 走真实开关路径关闭
+            app.update()
+            check("守护可关闭", not app._guard.is_active())
+            check("守护按钮文字复原", app.btn_guard.text == "守护本机", app.btn_guard.text)
+            check("守护开关持久化关闭", core.guard_enabled() is False)
+        except Exception:
+            check("s6c", False, traceback.format_exc()[-300:])
+
     # 7. 退出
     def s7():
         check("关闭流程不抛异常", True)
@@ -235,7 +267,7 @@ def run():
     wait_then(lambda: not app._busy and len(app._devices) > 0, lambda: (
         s1(), app.after(300, s2), app.after(2600, s3), app.after(3000, s4),
         app.after(3400, s5), app.after(3800, s6), app.after(4300, s6b),
-        app.after(5600, s7)))
+        app.after(4900, s6c), app.after(6200, s7)))
     app.mainloop()
     restore_state()
 

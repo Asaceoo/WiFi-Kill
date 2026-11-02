@@ -70,9 +70,10 @@ class App(tk.Tk):
         self._opts = (1.5, False)
         self._ndp_on = False              # IPv6 阻断开关，默认关（两道门之一）
         self._v6env = None                # ipv6.V6Env，扫描后探测
-        self._ndp = None                  # ipv6.NdpBlocker，同一时刻最多一个
-        self._ndp_ip = ""                 # 当前 IPv6 阻断的目标 IP
-        self._ndp_state = ""              # "" / "ok" / "miss"（探明失败）
+        import ipv6 as _v6mod
+        self._ndp_mgr = _v6mod.NdpManager()   # 多目标 IPv6 阻断管理器
+        self._guard = core.Guard(self._net, interval=2.0, dry_run=self._opts[1])
+        self._guard_on = core.guard_enabled()   # 本机守护（主动防御）开关，持久化
         self._tray = None
         self._tray_hinted = False
         self._quitting = False
@@ -201,6 +202,12 @@ class App(tk.Tk):
                                        kind="danger", font=f)
         self.btn_free = ui.CanvasButton(cv, "全部放行", 0, 0, 112, 38,
                                         command=self.do_unblock_all, kind="ok", font=f)
+        self.btn_sel_all = ui.CanvasButton(cv, "全选", 0, 0, 56, 34,
+                                           command=self._select_all, kind="ghost", font=b)
+        self.btn_sel_inv = ui.CanvasButton(cv, "反选", 0, 0, 56, 34,
+                                           command=self._select_invert, kind="ghost", font=b)
+        self.btn_guard = ui.CanvasButton(cv, "守护本机", 0, 0, 92, 34,
+                                         command=self._toggle_guard, kind="ghost", font=b)
         for x in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free):
             x.set_enabled(False)
 
@@ -305,7 +312,8 @@ class App(tk.Tk):
 
         ty = ny + card_h + 20
         bx = P
-        for btn in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free):
+        for btn in (self.btn_scan, self.btn_block, self.btn_all, self.btn_free,
+                    self.btn_sel_all, self.btn_sel_inv, self.btn_guard):
             btn.x, btn.y = bx, ty
             self._place_btn(btn)
             bx += btn.w + 10
@@ -384,6 +392,7 @@ class App(tk.Tk):
 
         n_online = len(self._devices)
         n_block = len(self._killer.targets()) if self._killer else 0
+        n_block += len(self._ndp_mgr.active_ips())
         env = self._v6env
         chips = [(f"在线 {n_online}", ui.SAGE_BG, ui.SAGE_DK)]
         if n_block:
@@ -393,6 +402,10 @@ class App(tk.Tk):
             chips.append(("IPv6 已接管" if on else "IPv6 未覆盖",
                           ui.SAGE_BG if on else ui.SAND_BG,
                           ui.SAGE_DK if on else getattr(ui, "SAND_DK", ui.SAND)))
+        if self._guard.is_active():
+            ac = self._guard.anomaly_count
+            chips.append(("守护中" + (f"·纠正{ac}" if ac else ""),
+                          ui.OLIVE_BG, ui.OLIVE_DK))
 
         font = tkfont.Font(font=self.F["small"])
         x = g["w"] - g["P"]
@@ -408,7 +421,8 @@ class App(tk.Tk):
             x -= 10
 
         self._chips_left = x
-        vals = (n_online, n_block, self._ndp_on)
+        vals = (n_online, n_block, self._ndp_on, self._guard.is_active(),
+                self._guard.anomaly_count)
         if getattr(self, "_chip_vals", None) not in (None, vals) and ids:
             self._ui.after(10, lambda i=list(ids): self._chip_pop(i))
         self._chip_vals = vals
@@ -436,6 +450,7 @@ class App(tk.Tk):
 
     def _footer_text(self, shown: int | None = None) -> str:
         blocked = len(self._killer.targets()) if self._killer else 0
+        blocked += len(self._ndp_mgr.active_ips())
         total = len(self._devices) if shown is None else shown
         return f"共 {total} 台设备 · 阻断中 {blocked} 台 · 关闭窗口将驻留托盘"
 
@@ -731,6 +746,13 @@ class App(tk.Tk):
         self._net = ni
         self._devices = devs
         self._refresh_v6env(ni)
+        # 守护本机：同步最新网络上下文；若已开启则确保运行（扫描自愈，断网重连也能恢复）
+        self._guard.ni = ni
+        self._guard.v6env = self._v6env
+        if self._guard_on and not self._guard.is_active():
+            self._guard.dry_run = self._opts[1]
+            self._guard.start()
+        self._sync_guard_btn()
         self._render_net()
         self._render_rows(animate=True)
         self._animate_footer()
@@ -775,12 +797,18 @@ class App(tk.Tk):
 
     def _state_of(self, d: core.Device) -> tuple[str, str]:
         """状态列：这台设备「正被怎样对待」。"""
-        if self._killer and any(t.ip == d.ip for t in self._killer.targets()):
-            if self._ndp and d.ip == self._ndp_ip:
-                return "阻断中·双栈", "blocked"
-            if self._ndp_state == "miss" and d.ip == self._ndp_ip:
-                return "阻断中·仅v4", "v4only"
+        v4 = bool(self._killer and any(t.ip == d.ip for t in self._killer.targets()))
+        v6 = self._ndp_mgr.state_of(d.ip) if self._ndp_on else ""
+        if v4 and v6 == "ok":
+            return "阻断中·双栈", "blocked"
+        if v4 and v6 == "miss":
+            return "阻断中·仅v4", "v4only"
+        if v4:
             return "阻断中", "blocked"
+        if v6 == "ok":
+            return "阻断中·IPv6", "blocked"
+        if v6 == "miss":
+            return "仅v4·未探明", "v4only"
         return "未阻断", ""
 
     def _render_rows(self, animate: bool = False):
@@ -820,6 +848,7 @@ class App(tk.Tk):
                 self.tree.selection_add(iid)
 
         blocked = len(self._killer.targets()) if self._killer else 0
+        blocked += len(self._ndp_mgr.active_ips())
         if self._badge_dot:
             self._badge_dot.set(ui.ROSE if blocked else ui.OLIVE, pulse=blocked > 0)
         if blocked:
@@ -943,16 +972,7 @@ class App(tk.Tk):
             messagebox.showwarning("无法阻断", f"{msg}\n\n请先处理顶部提示。")
             return
 
-        # 第二道门：IPv6 阻断开启时只允许单目标
-        if self._ndp_on and len(picks) > 1:
-            messagebox.showwarning(
-                "IPv6 阻断只支持单目标",
-                "开启 IPv6 阻断后，同时只能阻断 1 台设备。\n\n"
-                "原因：定向投毒需要逐台探明链路本地地址，"
-                "多目标并行会让整网 IPv6 的失控风险不可控。\n"
-                "需要批量阻断时，请先在「设置」里关闭 IPv6 阻断。")
-            return
-
+        # 第二道门已移除：IPv6 阻断现已支持多目标（NdpManager 逐目标独立护栏）。
         self._set_busy(True, "正在阻断…")
 
         def work():
@@ -974,13 +994,22 @@ class App(tk.Tk):
             if added and not k.is_active():
                 k.start()
 
-            v6msg = ""
-            if added and self._ndp_on and picks:
+            v6msgs = []
+            if added and self._ndp_on and self._v6env:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _add_one(d):
+                    return self._ndp_mgr.add(k.ni, self._v6env, d, self._opts[0])
+
                 try:
-                    v6msg = self._start_ndp(k.ni, picks[0])
+                    with ThreadPoolExecutor(max_workers=min(len(picks), 4)) as ex:
+                        futs = {d.ip: ex.submit(_add_one, d) for d in picks}
+                    for d in picks:
+                        _ok, _m = futs[d.ip].result()
+                        v6msgs.append(_m)
                 except Exception as e:
-                    self._ndp_state = "miss"
-                    v6msg = f"IPv6 阻断启动异常：{e}"
+                    v6msgs.append(f"IPv6 阻断启动异常：{e}")
+            v6msg = "；".join(v6msgs)
 
             def done():
                 if added:
@@ -988,7 +1017,8 @@ class App(tk.Tk):
                 if skipped:
                     self.log("跳过：" + "，".join(skipped), "warn")
                 if v6msg:
-                    self.log(v6msg, "ok" if self._ndp else "warn")
+                    ok_any = bool(self._ndp_mgr.active_ips())
+                    self.log(v6msg, "ok" if ok_any else "warn")
                 self._render_rows()
                 self._render_banner()
                 for d in picks:
@@ -997,50 +1027,15 @@ class App(tk.Tk):
             self._post(done)
         threading.Thread(target=work, daemon=True).start()
 
-    def _start_ndp(self, ni, dev) -> str:
-        """探明目标 LLA 并启动 IPv6 定向阻断。必须在工作线程里调用。"""
-        import ipv6 as v6
-
-        env = self._v6env
-        if env is None or not env.dual_stack:
-            self._ndp_state = "miss"
-            return "本网未检测到 IPv6，跳过 IPv6 阻断"
-
-        self._stop_ndp()
-        lla, how = v6.find_lla(ni.iface, dev.mac, env.my_lla, sniff_seconds=12.0)
-        if not lla:
-            self._ndp_state = "miss"
-            self._ndp_ip = dev.ip
-            return (f"未能探明 {dev.ip} 的 IPv6 地址（{how}）—— "
-                    f"该设备的 IPv6 流量未阻断，界面已标注「仅v4」")
-
-        blocker = v6.NdpBlocker(ni, env, dev.ip, dev.mac, lla,
-                                interval=self._opts[0])
-        ok, why = blocker.start()
-        if not ok:
-            self._ndp_state = "miss"
-            self._ndp_ip = dev.ip
-            return f"IPv6 定向阻断未启动：{why}"
-
-        self._ndp = blocker
-        self._ndp_ip = dev.ip
-        self._ndp_state = "ok"
-        return f"IPv6 定向阻断已生效：{dev.ip} → {lla}（来源 {how}）"
-
-    def _stop_ndp(self, restore: bool = True):
-        b = self._ndp
-        self._ndp = None
-        self._ndp_ip = ""
-        self._ndp_state = ""
-        if not b:
-            return 0
-        try:
-            n = b.stop(restore=restore)
+    def _stop_ndp(self, ip: str | None = None, restore: bool = True):
+        """停止 IPv6 阻断。ip=None 停止全部，否则只停指定目标。"""
+        if ip is None:
+            n = self._ndp_mgr.restore_all(restore=restore)
+        else:
+            n = self._ndp_mgr.remove(ip, restore=restore)
+        if n:
             self.log(f"IPv6 阻断已停止，回填 {n} 次", "info")
-            return n
-        except Exception as e:
-            self.log(f"IPv6 阻断停止异常：{e}", "warn")
-            return 0
+        return n
 
     def do_unblock_all(self):
         if not self._killer or not self._killer.targets():
@@ -1062,17 +1057,72 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _unblock_selected(self):
-        if not self._killer:
+        if not self._killer and not self._ndp_mgr.active_ips():
             return
         sel = list(self.tree.selection())
 
         def work():
-            if self._ndp_ip and self._ndp_ip in sel:
-                self._stop_ndp()
             for ip in sel:
-                self._killer.remove(ip)
+                if ip in self._ndp_mgr.active_ips():
+                    self._ndp_mgr.remove(ip)
+            if self._killer:
+                for ip in sel:
+                    self._killer.remove(ip)
             self._post(self._render_rows)
         threading.Thread(target=work, daemon=True).start()
+
+    def _select_all(self):
+        """选中当前可见的全部设备行（不跨隐藏的白名单行）。"""
+        try:
+            self.tree.selection_set(*self.tree.get_children())
+        except tk.TclError:
+            pass
+
+    def _select_invert(self):
+        """反选：当前选中的取消，未选中的全选。"""
+        try:
+            cur = set(self.tree.selection())
+            allc = set(self.tree.get_children())
+            self.tree.selection_set(*(allc - cur))
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ 本机守护
+
+    def _sync_guard_btn(self):
+        """按真实运行状态刷新「守护本机」按钮外观（ghost ↔ primary）。"""
+        if not hasattr(self, "btn_guard"):
+            return
+        on = self._guard_on and self._guard.is_active()
+        self.btn_guard.set_text("守护中" if on else "守护本机")
+        self.btn_guard.set_kind("primary" if on else "ghost")
+
+    def _start_guard(self) -> bool:
+        """尝试启动守护；成功返回 True。失败（无网关等）返回 False。"""
+        ni = self._net
+        if not ni.gateway_ip:
+            return False
+        self._guard.ni = ni
+        self._guard.v6env = self._v6env
+        self._guard.dry_run = self._opts[1]
+        return self._guard.start()
+
+    def _toggle_guard(self):
+        if self._guard_on:
+            self._guard.stop()
+            self._guard_on = False
+            core.set_guard_enabled(False)
+            self.log("本机守护已关闭", "info")
+        else:
+            ok = self._start_guard()
+            if ok:
+                self._guard_on = True
+                core.set_guard_enabled(True)
+                self.log("本机守护已开启（主动防御）", "ok")
+            else:
+                self.log("本机守护启动失败：请先扫描到网关与真实网关 MAC", "warn")
+        self._sync_guard_btn()
+        self._draw_chips()
 
     def _on_double(self, _e):
         if not self._killer:
@@ -1252,6 +1302,7 @@ class App(tk.Tk):
                 self._stop_ndp(restore=restore)
                 if restore and self._killer:
                     self._killer.restore_all()
+                self._guard.stop()   # 退出时一并停止本机守护
             except Exception:
                 pass
             self._post(self._finish)
@@ -1342,10 +1393,10 @@ class App(tk.Tk):
         elif not v6_ok:
             v6_hint = "本网未检测到 IPv6 默认路由，此项不可用（不影响 ARP 阻断）。"
         else:
-            v6_hint = ("本网检测到全局 IPv6。开启后会对单个目标做定向 NDP 投毒，"
-                       "只断经网关的出站流量。\n"
-                       "内置失控保护：阻断期间持续自检，本机 IPv6 异常立即停手回填。")
-        tk.Checkbutton(body, text="启用 IPv6 阻断（实验）—— 同时只能断 1 台",
+            v6_hint = ("本网检测到全局 IPv6。开启后会对每个目标做定向 NDP 投毒，"
+                       "支持多目标并发、只断经网关的出站流量。\n"
+                       "内置失控保护：每个目标独立自检，本机 IPv6 异常立即停手回填。")
+        tk.Checkbutton(body, text="启用 IPv6 阻断（实验）—— 支持多目标",
                        variable=ndp, bg=ui.CARD, fg=ui.TEXT, font=self.F["small"],
                        selectcolor=ui.BG, activebackground=ui.CARD,
                        highlightthickness=0, bd=0,
@@ -1356,17 +1407,44 @@ class App(tk.Tk):
                  justify="left", wraplength=430).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
+        guard = tk.BooleanVar(value=self._guard_on)
+        guard_hint = ("持续守护本机免遭外部 ARP/NDP 投毒：周期核对并纠正网关真实 MAC。"
+                      "即使不主动阻断任何设备也生效。检测到投毒会自动纠正并提示。")
+        tk.Checkbutton(body, text="守护本机（主动防御）", variable=guard,
+                       bg=ui.CARD, fg=ui.TEXT, font=self.F["small"],
+                       selectcolor=ui.BG, activebackground=ui.CARD,
+                       highlightthickness=0, bd=0).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        tk.Label(body, text=guard_hint,
+                 bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"],
+                 justify="left", wraplength=430).grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        auto = tk.BooleanVar(value=core.autostart_enabled())
+        auto_hint = ("已写入注册表 Run 键，登录时自动以管理员身份启动（最小化到托盘）。"
+                     if core.WINDOWS else "当前平台不支持开机自启。")
+        tk.Checkbutton(body, text="开机自动启动（管理员）", variable=auto,
+                       bg=ui.CARD, fg=ui.TEXT, font=self.F["small"],
+                       selectcolor=ui.BG, activebackground=ui.CARD,
+                       highlightthickness=0, bd=0,
+                       state=("normal" if core.WINDOWS else "disabled")).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(16, 0))
+        tk.Label(body, text=auto_hint,
+                 bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"],
+                 justify="left", wraplength=430).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         tk.Label(body, text=f"白名单：{core.WHITELIST_FILE.name}\n"
                             f"状态：{core.STATE_FILE.name}（均在程序目录）",
                  bg=ui.CARD, fg=ui.TEXT3, font=self.F["tiny"], justify="left").grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(16, 0))
+            row=8, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
         tk.Label(body,
                  text="免责声明：本工具仅用于你拥有或已获授权的网络的学习研究。"
                       "阻断他人设备可能违反法律法规与网络使用条款。",
                  bg=ui.CARD, fg=ui.SAND_DK, font=self.F["tiny"],
                  justify="left", wraplength=430).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+            row=9, column=0, columnspan=3, sticky="w", pady=(14, 0))
 
         def save():
             try:
@@ -1378,21 +1456,48 @@ class App(tk.Tk):
             if self._killer:
                 self._killer.interval = val
                 self._killer.dry_run = dry.get()
+            self._guard.dry_run = dry.get()   # 演练模式同样作用于守护
 
             if ndp.get() != self._ndp_on:
                 self._ndp_on = ndp.get()
                 if not self._ndp_on:
-                    if self._ndp:
+                    if self._ndp_mgr.active_ips():
                         threading.Thread(target=self._stop_ndp, daemon=True).start()
                     self.log("IPv6 阻断已关闭", "info")
                 else:
-                    self.log("IPv6 阻断已启用，仅对下一次阻断生效，且同时只支持 1 台", "warn")
+                    self.log("IPv6 阻断已启用，仅对下一次阻断生效", "warn")
+
+            if auto.get() != core.autostart_enabled():
+                ok = core.set_autostart(auto.get())
+                if ok:
+                    self.log("开机自启已" + ("开启" if auto.get() else "关闭"), "info")
+                else:
+                    messagebox.showwarning("开机自启失败",
+                        "无法写入注册表，请以管理员身份运行后再试。", parent=win)
+
+            if guard.get() != self._guard_on:
+                self._guard_on = guard.get()
+                if self._guard_on:
+                    ok = self._start_guard()
+                    if ok:
+                        core.set_guard_enabled(True)
+                        self.log("本机守护已开启（主动防御）", "ok")
+                    else:
+                        self._guard_on = False
+                        messagebox.showwarning("守护本机",
+                            "暂时无法启动：请先扫描到网关与真实网关 MAC。", parent=win)
+                else:
+                    self._guard.stop()
+                    core.set_guard_enabled(False)
+                    self.log("本机守护已关闭", "info")
+            self._sync_guard_btn()
+            self._draw_chips()
             self.log(f"设置已保存：间隔 {val}s，演练 {'开' if dry.get() else '关'}", "info")
             self._render_banner()
             win.destroy()
 
         btns = tk.Frame(body, bg=ui.CARD)
-        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(20, 0))
+        btns.grid(row=10, column=0, columnspan=3, sticky="e", pady=(20, 0))
         tk.Button(btns, text="取消", command=win.destroy, relief="flat", bd=0,
                   bg=ui.CARD_ALT, fg=ui.TEXT2, font=self.F["small"],
                   padx=16, pady=6, cursor="hand2").pack(side="right")
@@ -1403,8 +1508,11 @@ class App(tk.Tk):
 
 
 def main():
+    minimized = "--minimized" in sys.argv
     try:
         app = App()
+        if minimized:
+            app.withdraw()
         app.mainloop()
     except SystemExit:
         raise

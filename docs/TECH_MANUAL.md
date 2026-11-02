@@ -1,6 +1,6 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.3.1** · 对应程序：**v2.3.1** · 更新日期：2026-11-02
+> 文档版本：**v1.4.0** · 对应程序：**v2.4.0** · 更新日期：2026-11-02
 
 ---
 
@@ -167,6 +167,36 @@ Tk 动画最经典的死法是：窗口销毁后 `after` 回调继续触发，�
 | > 32px | 3 道弧 + 圆点 + 斜杠 |
 
 生成 9 个尺寸（16–256）打进单个 ICO，托盘/标题栏/任务栏各取所需。
+
+### 2.7 本机主动防御（Guard）· v2.4.0 新增
+
+`core.Guard` 与「阻断」是两套独立机制：阻断是**主动攻击**他人，守护是**被动防御**本机。
+它只做一件事——持续保证「本地 ARP/NDP 缓存里，网关 IP/LLA 指向的是真实网关 MAC」。
+
+关键设计点（均经对抗性审查硬化）：
+
+- **基准建立** —— 优先用扫描得到的 `ni.gateway_mac`，再用一次实时 ARP 询问交叉验证。
+  若两者**不一致**（疑似缓存已被投毒），直接 **fail closed**：不启动、不发包、不把可疑 MAC 钉死。
+- **只发真实映射** —— 纠正包里 `ARP.hwsrc / NDP.lladdr` 永远是网关真实 MAC，绝不伪造第三方。
+- **L2 源用本机 MAC** —— 免费 ARP / NA 的以太网源地址是本机，而非网关，避免冒充网关触发交换机端口安全。
+- **IPv6 重宣告单播到本机** —— `eth_dst = 本机 MAC`，绝不发往组播/广播（与 `NdpBlocker._send` 的组播拒发同源）。
+- **去抖** —— 网关 MAC 连续 2 次检测为漂移（或缓存连续 2 次缺失）才动作，避免瞬时重协商
+  或 `arp_table` 偶发解析失败触发误广播。
+- **网络切换软重启** —— 每拍核对 `ni.gateway_ip`（GUI 每次扫描都会注入最新 ni）：网关 IP
+  变化即触发 `_rebaseline`。否则换 Wi-Fi/换路由器后，守护会拿着旧基准继续动作 ——
+  轻则在新网络广播不存在的映射，**重则把更换后的真实网关持续"纠正"回旧 MAC，导致本机断网**。
+- **重估（rebaseline）双源一致** —— 重估时的基准采纳比启动时更严格（`strict=True`）：
+  必须「扫描缓存有效 且 实时 ARP 可答 且 两者一致」才采纳新基准；实时询问失败或单源
+  证据一律 fail closed 暂停纠正。原因：实时询问本身可能被攻击者抢答，单源采纳等于自伤。
+- **纠正失效触发重估** —— 同一漂移连续纠正 3 次后仍在漂移，说明要么攻击者持续投毒、
+  要么基准已过时（路由器已更换），自动触发重估，避免无限拉锯。
+- **start() 防并发** —— stop() 后旧守护线程若尚未退出，start() 会先 join 等待；仍不退出
+  则拒绝本次启动，避免两个守护线程并发 `_tick` 重复发包。
+- **dry_run 友好** —— 演练模式下只记录、绝对不发包。
+- **生命周期** —— 随主窗口启动/扫描自愈（断网重连后自动恢复运行），退出时随 `_quit` 停止。
+
+状态通过 `Guard.status()` 暴露（active / 网关基准 / 异常计数 / 上次动作），GUI 页脚「守护中」徽章据此显示，
+检测到投毒时自动纠正并写日志告警。
 
 ---
 
@@ -427,7 +457,7 @@ Npcap 安装时的选项决定了普通用户能否发帧。以 admin 作为门�
 
 三层，全部可重复执行。
 
-### 11.1 边界测试 `tests/test_edge.py`（23 项）
+### 11.1 边界测试 `tests/test_edge.py`（34 项）
 
 不碰真实设备，全部用 `dry_run` 或伪造目标：
 
@@ -447,7 +477,7 @@ Npcap 安装时的选项决定了普通用户能否发帧。以 admin 作为门�
 | `t_logger_isolation` | 日志回调抛错被隔离 |
 | `t_protected_device` | 网关/本机被标记受保护、普通设备不受保护、单目标过滤只留普通设备、仅选网关无可阻断目标（v2.3.0 新增） |
 
-### 11.2 IPv6 报文级 `tests/test_ipv6.py`（34 项）
+### 11.2 IPv6 报文级 `tests/test_ipv6.py`（51 项）
 
 不碰网卡、不发一个包 —— CI（ubuntu-latest，无 Npcap）也能跑：
 
@@ -523,6 +553,30 @@ ARP frames on wire    = {target: 12, gw: 12}   # 24 帧真实毒化报文被嗅�
 > 因此无法对其 LLA 做**端到端 IPv6 阻断**——这正是 §13 记录的已知限制，
 > 并非缺陷。IPv6 的报文构造、安全闸、单播上线与网关可达性均已真实验证。
 
+### 11.6 守护单元测试 `tests/test_guard.py`（17 项）
+
+不碰真实网络，网络层全部用 fake 注入，断言「只发真实网关映射、不冒充、有去抖、dry_run 不发包」：
+
+| 用例 | 断言 |
+|---|---|
+| `no_baseline_no_start` | 拿不到网关 MAC 时 start() 失败、不启线程 |
+| `reassert_sends_true_mapping` | 纠正包 ARP 层 `hwsrc/psrc` 是网关真实映射，L2 源是本机 MAC |
+| `tick_no_drift_no_send` | 缓存正常时绝不打扰网络 |
+| `tick_drift_detected_with_debounce` | 连续 2 次漂移才判定投毒并纠正（去抖） |
+| `dry_run_no_send` | 演练模式只记录、不发包 |
+| `v6_reassert_is_unicast_true_mapping` | IPv6 重宣告单播到本机、只发真实映射 |
+| `v6_dry_run_no_send` | IPv6 演练不发包 |
+| `start_stop_lifecycle` | 正常启停、线程受控 |
+| `baseline_disagreement_fail_closed` | 缓存与实时询问分歧时不启动（fail closed） |
+| `baseline_agreement_starts` | 一致时正常启动 |
+| `ndp_table_parse_windows` | 正确解析 `netsh` 输出得到网关 LLA→MAC |
+| `gateway_ip_change_rebaselines` | 网关 IP 变化 → 重建基准，一致才采纳，当拍不发包 |
+| `gateway_ip_change_fail_closed` | 换网络后新基准不可达 → 清空基准，绝不再发包 |
+| `rebaseline_adopts_new_mac_when_consistent` | 纠正失效触发重估，缓存+实时一致才采纳新 MAC |
+| `rebaseline_fail_closed_when_disagreement` | 重估时分歧 → 清空基准 fail closed，不新增发包 |
+| `cache_missing_debounce` | 缓存缺失与漂移共用去抖，连续 2 次才宣告；缺失不计投毒 |
+| `start_rejects_when_old_thread_alive` | stop 后旧线程未退出时 start 拒绝（防双线程并发） |
+
 ---
 
 ## 12. 打包与版本管理
@@ -552,7 +606,7 @@ python build.py
 文档里的标记行格式固定，构建脚本靠正则定位：
 
 ```markdown
-> 文档版本：**v1.3.1** · 对应程序：**v2.3.1** · 更新日期：2026-11-02
+> 文档版本：**v1.4.0** · 对应程序：**v2.4.0** · 更新日期：2026-11-02
 ```
 
 ### 12.3 打包参数与取舍

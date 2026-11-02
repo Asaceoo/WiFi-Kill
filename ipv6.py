@@ -22,6 +22,7 @@ ARP 只管 IPv4。现代家庭网络普遍存在全局 IPv6（运营商 RA 下�
 from __future__ import annotations
 
 import ipaddress
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -244,6 +245,34 @@ def mdns_probe(iface: str, my_lla: str, seconds: float = 5.0) -> dict[str, tuple
             except Exception:
                 pass
     return found
+
+
+def ndp_table() -> dict[str, str]:
+    """读取本机 IPv6 邻居缓存，返回 {链路本地地址(去 zone): MAC}。
+
+    仅用于「本机守护」的 NDP 漂移监测：把网关 LLA 当前的 MAC 与受信任基准比对。
+    解析失败（无 ip 命令、netsh 异常）一律返回空 dict —— 监测是 best-effort，
+    缺失时不报警，由周期性重宣告继续兜底防御。
+    """
+    table: dict[str, str] = {}
+    _mac = re.compile(r"((?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2})")
+    _v6 = re.compile(r"([0-9a-fA-F:]+)(?:%\d+)?")
+    if core.WINDOWS:
+        out = core._run_hidden(["netsh", "interface", "ipv6", "show", "neighbors"], "gbk")
+    else:
+        out = core._run_hidden(["ip", "-6", "neigh"], "utf-8")
+    if not out:
+        return table
+    for line in out.splitlines():
+        m_v = _v6.search(line)
+        m_m = _mac.search(line)
+        if not (m_v and m_m):
+            continue
+        lla = m_v.group(1).split("%")[0].lower()
+        mac = m_m.group(1).replace("-", ":").lower()
+        if lla and mac:
+            table[lla] = mac
+    return table
 
 
 def find_lla(iface: str, mac: str, my_lla: str,
@@ -562,3 +591,82 @@ def _parse_neighbors(txt: str, want: str | None = None) -> str | None:
             continue
         return mac
     return None
+
+
+# ------------------------------------------------------------------ 多目标管理
+
+class NdpManager:
+    """管理多个并发的 NdpBlocker，实现多目标 IPv6 阻断。
+
+    与单实例相比，安全护栏逐目标独立生效、一个都不放松：
+      - 每个 NdpBlocker.start() 内部的 preflight（网关/目标校验、LLA 探明）
+      - 每个 NdpBlocker 自己的 watchdog（本机网关映射被改立即回滚）
+      - _send 拒绝组播（MULTICAST_MAC_PREFIX 检查）—— 任一目标都不可能切断整网
+    另加一层全局护栏：受保护设备（网关/本机）在这里就被拒，
+    与 core.is_protected() 同源，作为 GUI 过滤之外的最后一道。
+    """
+
+    def __init__(self):
+        self._blockers: dict[str, NdpBlocker] = {}
+        self._lock = threading.Lock()
+
+    def active_ips(self) -> list[str]:
+        with self._lock:
+            return [ip for ip, b in self._blockers.items() if b and not b.aborted]
+
+    def add(self, ni, env: V6Env, dev, interval: float = 1.0,
+            sniff_seconds: float = 12.0) -> tuple[bool, str]:
+        """探明目标 LLA 并启动定向阻断。返回 (成功?, 信息)。"""
+        dev_ip = getattr(dev, "ip", "?")
+        if not (env and env.dual_stack):
+            return False, "本网未检测到 IPv6，跳过 IPv6 阻断"
+        if getattr(dev, "note", "") in ("网关", "本机"):
+            return False, f"{dev_ip} 是受保护设备（网关/本机），IPv6 不可阻断"
+
+        lla, how = find_lla(ni.iface, dev.mac, env.my_lla, sniff_seconds=sniff_seconds)
+        if not lla:
+            return False, (f"未能探明 {dev_ip} 的 IPv6 地址（{how}）"
+                           f"—— 该设备的 IPv6 流量未阻断")
+        blocker = NdpBlocker(ni, env, dev.ip, dev.mac, lla, interval=interval)
+        ok, why = blocker.start()
+        if not ok:
+            return False, f"IPv6 定向阻断未启动：{why}"
+        with self._lock:
+            self._blockers[dev.ip] = blocker
+        return True, f"IPv6 定向阻断已生效：{dev_ip} → {lla}（来源 {how}）"
+
+    def remove(self, ip: str, restore: bool = True) -> int:
+        with self._lock:
+            b = self._blockers.pop(ip, None)
+        if b:
+            try:
+                b.stop(restore=restore)
+                return 1
+            except Exception:
+                return 0
+        return 0
+
+    def restore_all(self, restore: bool = True) -> int:
+        with self._lock:
+            items = list(self._blockers.items())
+            self._blockers.clear()
+        n = 0
+        for ip, b in items:
+            try:
+                b.stop(restore=restore)
+                n += 1
+            except Exception:
+                pass
+        return n
+
+    def any_aborted(self) -> bool:
+        with self._lock:
+            return any(b.aborted for b in self._blockers.values())
+
+    def state_of(self, ip: str) -> str:
+        """该 IP 的 IPv6 阻断状态：''（未阻断）/ 'ok'（双栈阻断）/ 'miss'（探明失败）。"""
+        with self._lock:
+            b = self._blockers.get(ip)
+        if b is None:
+            return ""
+        return "miss" if b.aborted else "ok"

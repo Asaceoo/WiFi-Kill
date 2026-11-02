@@ -242,11 +242,71 @@ def t_protected_api():
     check("普通设备可正常入队", len(k.targets()) == 1, str(k.targets()))
 
 
+class _FakeWinreg:
+    """内存版注册表，仅供 t_autostart_registry 用，不碰真实注册表。
+
+    严格模仿 winreg 模块级 API：OpenKey 返回 key 对象，
+    SetValueEx/QueryValueEx/DeleteValue 以 key 为首个参数。
+    """
+
+    HKEY_CURRENT_USER = 1
+    KEY_SET_VALUE = 0x0002
+    REG_SZ = 1
+    _store: dict = {}
+
+    class _Key:
+        def __init__(self, store):
+            self.s = store
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def OpenKey(self, _root, _path, *a, **k):
+        return self._Key(self._store)
+
+    def QueryValueEx(self, key, name):
+        if name in key.s:
+            return (key.s[name], self.REG_SZ)
+        raise FileNotFoundError()
+
+    def SetValueEx(self, key, name, _t, _d, val):
+        key.s[name] = val
+
+    def DeleteValue(self, key, name):
+        if name in key.s:
+            del key.s[name]
+        else:
+            raise FileNotFoundError()
+
+
+@case
+def t_autostart_registry():
+    """开机自启写/删 Run 键，值必须含 exe 路径与 --minimized。"""
+    orig = core.winreg
+    fake = _FakeWinreg()
+    core.winreg = fake
+    try:
+        check("初始未启用", not core.autostart_enabled())
+        check("写入成功", core.set_autostart(True))
+        check("已启用", core.autostart_enabled())
+        val = fake._store.get(core.AUTOSTART_NAME, "")
+        check("Run 值含 --minimized", "--minimized" in val, val)
+        check("Run 值为引号包裹的 exe 路径", val.startswith('"') and ".exe" in val, val)
+        check("删除成功", core.set_autostart(False))
+        check("禁用后未启用", not core.autostart_enabled())
+    finally:
+        core.winreg = orig
+
+
 def main():
     for fn in (t_corrupt_state, t_bad_mac, t_no_gateway_mac, t_idempotent,
                t_concurrent, t_dryrun_no_state, t_single_instance, t_bad_cidr,
                t_whitelist_mac, t_restore_clears, t_stop_is_clean,
-               t_logger_isolation, t_protected_device, t_protected_api):
+               t_logger_isolation, t_protected_device, t_protected_api,
+               t_autostart_registry):
         fn()
 
     print("\n=========== 边界测试 ===========")

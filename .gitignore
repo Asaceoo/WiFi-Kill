@@ -8,3 +8,7 @@ whitelist.txt
 
 # 自检脚本产出的截图
 t[0-9]*_*.png
+
+# 守护开关运行时状态
+guard.json
+selftest_out.txt

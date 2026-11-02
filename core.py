@@ -23,10 +23,15 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+try:
+    import winreg  # Windows 注册表；非 Windows 下置 None
+except ImportError:
+    winreg = None
+
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.4.0"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -269,6 +274,80 @@ def relaunch_elevated(extra_args: list[str] | None = None) -> bool:
             None, "runas", target, params, None, 1)
         return rc > 32
     except Exception:
+        return False
+
+
+# ------------------------------------------------------------------ 开机自启
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "WiFiKill"
+
+
+def autostart_enabled() -> bool:
+    """是否已写入 Run 键（开机自动启动）。"""
+    if not WINDOWS or winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            try:
+                val, _ = winreg.QueryValueEx(k, AUTOSTART_NAME)
+                return bool(val)
+            except FileNotFoundError:
+                return False
+    except Exception:
+        return False
+
+
+def set_autostart(enable: bool) -> bool:
+    """写/删 Run 键实现开机自动启动。HKCU 不需要管理员即可写入；
+    真正以管理员身份运行由 exe 的 UAC 清单（uac_admin）保证。
+
+    返回是否成功。失败（如权限不足）时由调用方提示用户。
+    """
+    if not WINDOWS or winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            if enable:
+                val = f'"{sys.executable}" --minimized'
+                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, val)
+            else:
+                try:
+                    winreg.DeleteValue(k, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as e:
+        LOG.emit("warn", f"设置开机自启失败：{e}")
+        return False
+
+
+# ------------------------------------------------------------------ 守护设置
+
+GUARD_FILE = APP_DIR / "guard.json"
+
+
+def guard_enabled() -> bool:
+    """是否开启了「本机守护（主动防御）」。"""
+    try:
+        if GUARD_FILE.exists():
+            return bool(json.loads(GUARD_FILE.read_text(encoding="utf-8")).get("enabled", False))
+    except Exception:
+        pass
+    return False
+
+
+def set_guard_enabled(enable: bool) -> bool:
+    """持久化守护开关；返回是否成功（理论上不会失败，除非程序目录只读）。"""
+    try:
+        tmp = GUARD_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"enabled": bool(enable)}, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+        os.replace(tmp, GUARD_FILE)
+        return True
+    except Exception as e:
+        LOG.emit("warn", f"保存守护设置失败：{e}")
         return False
 
 
@@ -766,6 +845,337 @@ class Killer:
             "gateway_mac": self.ni.gateway_mac,
             "targets": items,
         })
+
+
+# ------------------------------------------------------------------ 本机守护（主动防御）
+
+class Guard:
+    """本机主动防御：即使不主动阻断任何设备，也持续守护本机免遭外部 ARP/NDP 投毒。
+
+    原理：周期性核对本地 ARP（以及 IPv6 NDP）缓存中「网关 IP/LLA → MAC」映射，
+    是否仍是启动时确认的*真实*网关 MAC。若发现被改写成别的 MAC（典型投毒特征），
+    在去抖后记录异常，并重新向本机宣告「网关的真实 MAC」，把被篡改的缓存纠正回来。
+
+    安全不变量（对抗性审查逐条硬化）：
+    - 只发送「网关 IP ↔ 真实网关 MAC」这一条*真实*映射，绝不伪造任何第三方地址。
+    - 不触碰网关以外的任何 IP/MAC，不向任何第三方投毒。
+    - 没有可靠的网关 MAC 基准时绝不发送任何包（避免把错误映射钉死）。
+    - IPv6 重宣告一律单播到本机 MAC，绝不发往组播/广播（避免波及整网）。
+    - dry_run 仅记录，不发送真实包。
+    """
+
+    def __init__(self, ni: "NetInfo", interval: float = 2.0, dry_run: bool = False):
+        self.ni = ni
+        self.interval = max(1.0, float(interval))
+        self.dry_run = dry_run
+        self.v6env = None  # 由 GUI 在扫描后注入 ipv6.V6Env（含 gw_lla / my_lla）
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._gw_ip = (ni.gateway_ip or "").strip()
+        self._gw_mac = ""
+        self.last_check = 0.0
+        self.anomaly_count = 0
+        self.last_anomaly_time = 0.0
+        self._consecutive = 0
+        self._failed_corr = 0   # 漂移纠正后仍未恢复的连续次数（用于判断基准过时）
+        self._last_action = "待命"
+        # IPv6 上下文：(gw_lla, gw_mac, my_lla, iface)
+        self._v6: tuple[str, str, str, str] | None = None
+        self._v6_counter = 0
+
+    # --- 基准建立 ---
+
+    def _establish_baseline(self, *, strict: bool = False) -> str:
+        """确认受信任的网关 MAC：优先用扫描得到的 ni.gateway_mac，否则主动 ARP 询问。
+
+        对抗性加固：若缓存里的网关 MAC 与一次「实时 ARP 询问」返回的 MAC 不一致，
+        说明两者有分歧 —— 很可能缓存已被投毒、或本网段真有冲突。此刻不启动发包，
+        「fail closed」比「把某个可疑 MAC 钉死」更安全。
+
+        strict=True（重估场景）：必须「缓存有效 且 实时可答 且 两者一致」才返回基准。
+        实时询问失败时静默信任缓存只在启动场景可接受（缓存来自刚完成的扫描）；
+        重估发生在可疑状态下，单源证据一律拒绝 —— 攻击者改写的缓存不能自证。
+        """
+        from_cache = (self.ni.gateway_mac or "").lower()
+        if _MAC_RE.match(from_cache or ""):
+            try:
+                live = arp_query(self._gw_ip, self.ni)
+            except Exception:
+                live = None
+            if live and live.lower() != from_cache:
+                LOG.emit("warn",
+                         f"守护基线分歧：缓存 {from_cache} ≠ 实时询问 {live.lower()}，"
+                         f"疑似缓存已被投毒，守护不启动以避免钉死错误映射")
+                return ""
+            if strict and not live:
+                LOG.emit("warn", "守护基准重估：实时询问不可用，单源证据不足，拒绝采纳")
+                return ""
+            return from_cache
+        if strict:
+            # strict 模式下没有缓存作对照，实时应答无法自证可信
+            LOG.emit("warn", "守护基准重估：缺少扫描缓存对照，拒绝单源采纳")
+            return ""
+        try:
+            got = arp_query(self._gw_ip, self.ni)
+            if got:
+                return got.lower()
+        except Exception as e:
+            LOG.emit("debug", f"守护基准探测失败：{e}")
+        return ""
+
+    # --- 状态 ---
+
+    def is_active(self) -> bool:
+        return self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "active": self.is_active(),
+                "gw_ip": self._gw_ip,
+                "gw_mac": self._gw_mac,
+                "last_check": self.last_check,
+                "anomaly_count": self.anomaly_count,
+                "last_action": self._last_action,
+                "v6": self._v6 is not None,
+            }
+
+    # --- 生命周期 ---
+
+    def start(self) -> bool:
+        if self.is_active():
+            return True
+        # 防并发：上一次 stop() 后旧线程可能仍在收尾（sendp 未返回等），
+        # 必须等它真正退出再开新线程，避免两个守护线程同时 _tick 重复发包。
+        old = self._thread
+        if old is not None and old.is_alive():
+            old.join(timeout=3)
+            if old.is_alive():
+                LOG.emit("warn", "守护本机：旧守护线程尚未退出，本次不启动（避免并发双线程）")
+                return False
+        gw_ip = (self.ni.gateway_ip or "").strip()
+        if not gw_ip:
+            LOG.emit("warn", "守护本机：缺少网关 IP，无法启动")
+            return False
+        self._gw_ip = gw_ip
+        base = self._establish_baseline()
+        if not base:
+            # 没有可靠基准就不发包：宁可什么都不做，也绝不把错误映射钉死。
+            LOG.emit("warn", "守护本机：无法确认网关真实 MAC，不启动发包")
+            return False
+        with self._lock:
+            self._gw_mac = base
+            self._v6 = None
+            self._consecutive = 0
+            self._failed_corr = 0
+            self._last_action = "守护中"
+        env = self.v6env
+        if env is not None and getattr(env, "supported", False) and env.gw_lla \
+                and env.gw_mac and getattr(env, "my_lla", ""):
+            with self._lock:
+                self._v6 = (env.gw_lla, env.gw_mac.lower(), env.my_lla, self.ni.iface)
+        code, _ = l2_check()
+        if code != "ok":
+            LOG.emit("warn", f"守护本机：二层不可用（{code}），仅做监控不发包")
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                       name="wifikill-guard")
+        self._thread.start()
+        LOG.emit("ok", f"本机守护已启动：网关 {self._gw_ip} 基准 MAC {self._gw_mac}"
+                      + ("（含 IPv6 重宣告）" if self._v6 else ""))
+        return True
+
+    def stop(self):
+        self._stop.set()
+        th = self._thread
+        if th is not None and th.is_alive():
+            th.join(timeout=3)
+        self._thread = None
+        with self._lock:
+            self._last_action = "已停止"
+        LOG.emit("info", "本机守护已停止")
+
+    # --- 主循环 ---
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                LOG.emit("warn", f"守护本机异常：{e}")
+            self._stop.wait(self.interval)
+
+    def _tick(self):
+        now = time.time()
+        with self._lock:
+            self.last_check = now
+            gw_ip = self._gw_ip
+            gw_mac = self._gw_mac
+            v6 = self._v6
+        if not gw_ip or not gw_mac:
+            return
+
+        # ---- 网络切换检测：GUI 每次扫描都会把最新 ni 注入 self.ni ----
+        cur_gw_ip = (self.ni.gateway_ip or "").strip()
+        if cur_gw_ip and cur_gw_ip != gw_ip:
+            # 网关 IP 变了（换了 Wi-Fi/网卡/网段）：旧基准整体作废。
+            # 新基准仍走「缓存+实时一致才采纳」的完整建立流程。
+            with self._lock:
+                self._gw_ip = cur_gw_ip
+            LOG.emit("warn", f"检测到网关 IP 变化：{gw_ip} → {cur_gw_ip}，重建守护基准")
+            self._rebaseline()
+            return
+
+        # ---- IPv4 ARP 监控 + 纠正 ----
+        table = arp_table()
+        cur = (table.get(gw_ip) or "").lower()
+        with self._lock:
+            if not cur:
+                # 缓存缺失与漂移共用去抖：arp_table 偶发解析失败（命令超时返回空表）
+                # 不应立即触发全网广播，连续 2 次缺失才重新宣告。
+                self._consecutive += 1
+                n, missing = self._consecutive, True
+            elif cur == gw_mac:
+                self._consecutive = 0
+                self._failed_corr = 0
+                n, missing = 0, False
+            else:
+                self._consecutive += 1
+                n, missing = self._consecutive, False
+        if n >= 2:
+            if missing:
+                LOG.emit("info", f"网关 {gw_ip} 缓存持续缺失，重新宣告真实映射")
+                self._reassert("缓存缺失")
+            else:
+                with self._lock:
+                    self.anomaly_count += 1
+                    self.last_anomaly_time = now
+                    self._failed_corr += 1
+                    fc = self._failed_corr
+                LOG.emit("warn",
+                         f"检测到网关 MAC 漂移：缓存 {cur} ≠ 真实 {gw_mac}，"
+                         f"疑似 ARP 投毒，已自动纠正")
+                self._reassert("MAC 漂移")
+                if fc >= 3:
+                    # 纠正反复不生效：要么攻击者持续投毒，要么基准已过时
+                    # （路由器已更换）。重估基准，避免把新真实网关"纠正"回旧 MAC。
+                    self._rebaseline()
+
+        self._maybe_v6(v6)
+
+    def _rebaseline(self):
+        """重估守护基准（网络切换 / 纠正反复不生效时调用）。
+
+        对抗性设计：绝不因「单次实时询问与基准不同」就采纳新 MAC ——
+        实时询问本身可能被攻击者抢答毒化，采纳等于自伤。
+        仍沿用启动时的完整流程：缓存与实时**一致**才采纳；
+        分歧或不可达一律 fail closed（暂停纠正），并明确告知用户。
+        """
+        LOG.emit("warn", "守护：正在重估基准（网络切换或纠正反复不生效）…")
+        base = self._establish_baseline(strict=True)
+        with self._lock:
+            self._failed_corr = 0
+            if base and base != self._gw_mac:
+                self._gw_mac = base
+                self._consecutive = 0
+                self._v6 = None   # 旧 IPv6 上下文属于旧网络，作废待扫描重注入
+                self._last_action = f"基准已更新：{self._gw_ip} → {base}"
+                LOG.emit("ok", f"守护基准已更新：网关 {self._gw_ip} → {base}")
+            elif not base:
+                self._gw_mac = ""
+                self._v6 = None
+                self._last_action = "基准重估失败，暂停纠正（fail closed）"
+                LOG.emit("warn",
+                         "守护基准重估失败（缓存/实时分歧或不可达），"
+                         "暂停发包避免钉死错误映射（fail closed）")
+            else:
+                self._consecutive = 0
+                self._last_action = "基准复核一致，继续守护"
+
+    def _maybe_v6(self, v6):
+        """IPv6 重宣告 + best-effort 监控，约每 10 秒一次（避免过于频繁）。"""
+        if not v6:
+            return
+        self._v6_counter += 1
+        every = max(1, round(10.0 / self.interval))
+        if self._v6_counter % every != 0:
+            return
+        gw_lla, gw_mac, my_lla, _iface = v6
+        try:
+            import ipv6 as _v6mod
+            # best-effort 监控：本机 NDP 缓存里网关 LLA 的 MAC 是否被改
+            # （ndp_table 返回的 key 一律为小写去 zone，比对前先归一化）
+            tbl = _v6mod.ndp_table()
+            key = gw_lla.split("%")[0].lower()
+            cur = (tbl.get(key) or "").lower()
+            if cur and cur != gw_mac.lower():
+                LOG.emit("warn",
+                         f"检测到网关 IPv6 映射漂移：{gw_lla} 缓存 {cur} ≠ 真实 {gw_mac}，"
+                         f"疑似 NDP 投毒，已自动纠正")
+                with self._lock:
+                    self.anomaly_count += 1
+                    self.last_anomaly_time = time.time()
+            # 重宣告真实映射：L3 源是网关 LLA（属实），L2 源用本机 MAC（不冒充网关）
+            na = _v6mod.build_na(
+                eth_src=self.ni.my_mac, eth_dst=self.ni.my_mac,
+                ipv6_src=gw_lla, ipv6_dst=my_lla,
+                tgt=gw_lla, lladdr=gw_mac, solicited=0)
+            self._send_v6(na)
+        except Exception as e:
+            LOG.emit("debug", f"IPv6 守护处理失败：{e}")
+
+    # --- 发包（仅真实网关映射）---
+
+    def _reassert(self, reason: str):
+        """向全网重新宣告网关的真实 MAC，把被篡改的缓存纠正回来。"""
+        code, _ = l2_check()
+        if code != "ok":
+            with self._lock:
+                self._last_action = f"[{reason}] 二层不可用，跳过发包"
+            return
+        s = scapy_mod()
+        if s is None:
+            return
+        my_mac = (self.ni.my_mac or "").lower()
+        if not _MAC_RE.match(my_mac) or not _MAC_RE.match(self._gw_mac):
+            with self._lock:
+                self._last_action = f"[{reason}] MAC 无效，跳过"
+            return
+        # 免费 ARP：向全网宣告「网关 IP 的真实 MAC」（仅这条真实映射）。
+        # 注意：L2 源用「本机 MAC」而非网关 MAC —— 我们只是纠正缓存，
+        # 不冒充网关在二层出现，避免触发交换机端口安全/MAC 翻动告警。
+        pkt = (s.Ether(dst=BROADCAST, src=my_mac) /
+               s.ARP(op=2, hwsrc=self._gw_mac, psrc=self._gw_ip,
+                     hwdst=my_mac, pdst=self._gw_ip))
+        if self.dry_run:
+            with self._lock:
+                self._last_action = f"[演练] 宣告 {self._gw_ip} → {self._gw_mac}（{reason}）"
+            LOG.emit("debug",
+                     f"[演练] 守护宣告：{self._gw_ip} 的真实 MAC 是 {self._gw_mac}（{reason}）")
+            return
+        try:
+            s.sendp(pkt, iface=self.ni.iface, verbose=0, count=2)
+            with self._lock:
+                self._last_action = f"纠正：{self._gw_ip} → {self._gw_mac}（{reason}）"
+            LOG.emit("ok", f"已重新宣告网关真实 MAC，纠正缓存（{reason}）")
+        except Exception as e:
+            LOG.emit("warn", f"守护宣告失败：{e}")
+
+    def _send_v6(self, pkt):
+        code, _ = l2_check()
+        if code != "ok":
+            return
+        s = scapy_mod()
+        if s is None:
+            return
+        if self.dry_run:
+            LOG.emit("debug", "[演练] 守护 IPv6 重宣告（网关真实映射）")
+            return
+        try:
+            s.sendp(pkt, iface=self.ni.iface, verbose=0, count=1)
+        except Exception as e:
+            LOG.emit("debug", f"守护 IPv6 发送失败：{e}")
 
 
 # ------------------------------------------------------------------ 单实例锁

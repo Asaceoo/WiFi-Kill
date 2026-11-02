@@ -37,6 +37,7 @@ ROSE_BG   = "#F2E6E3"
 
 OLIVE     = "#8FA98B"   # 成功：灰橄榄
 OLIVE_BG  = "#E8EFE6"
+OLIVE_DK  = "#4E6B4A"   # 橄榄深色（守护徽章文字，与 ok 主题前景一致）
 
 SAND      = "#C4A785"   # 提示：灰驼
 SAND_BG   = "#F4EDE4"
@@ -195,6 +196,45 @@ class CanvasButton:
     def set_text(self, t: str):
         self.text = t
         self.cv.itemconfig(self.label, text=t)
+
+    def set_kind(self, kind: str):
+        """换肤：重设按钮主题色（如 ghost ↔ primary 表示开/关），颜色平滑过渡。"""
+        if kind == self.kind:
+            return
+        base, hover, fg, bd = self._palette(kind)
+        if not self.enabled:
+            self.kind = kind
+            self._c_base, self._c_hover, self._c_fg, self._c_bd = base, hover, fg, bd
+            return
+        # 颜色平滑过渡：从旧色插值到新色，避免「咔」地硬切
+        ob, oh, of = self._c_base, self._c_hover, self._c_fg
+        self.kind = kind
+        self._c_base, self._c_hover, self._c_fg, self._c_bd = base, hover, fg, bd
+        try:
+            self.cv.itemconfig(self.bg, outline=bd or "", width=1 if bd else 0)
+            self.cv.itemconfig(self.label, fill=fg)
+        except tk.TclError:
+            pass
+        state = {"i": 0}
+        steps = 9
+
+        def tick():
+            state["i"] += 1
+            p = ease_out(state["i"] / steps)
+            self._c_base = mix(ob, base, p)
+            self._c_hover = mix(oh, hover, p)
+            self._c_fg = mix(of, fg, p)
+            try:
+                self.cv.itemconfig(self.bg, fill=self._c_base)
+                self.cv.itemconfig(self.label, fill=self._c_fg)
+            except tk.TclError:
+                return
+            if state["i"] < steps:
+                self.cv.after(14, tick)
+            else:
+                self._c_base, self._c_hover, self._c_fg, self._c_bd = base, hover, fg, bd
+
+        tick()
 
     # --- 动画 ---
 

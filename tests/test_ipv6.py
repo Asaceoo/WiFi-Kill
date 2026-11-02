@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import ipv6  # noqa: E402
+import core  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -189,6 +190,96 @@ def test_valid_mac():
     check("拒绝非十六进制", not ipv6._valid_mac("zz:bb:cc:dd:ee:ff"))
 
 
+@case
+def test_ndp_manager_empty_safe():
+    """空管理器必须对所有查询返回安全值，且 restore_all/remove 不抛。"""
+    mgr = ipv6.NdpManager()
+    check("空 restore_all = 0", mgr.restore_all() == 0)
+    check("空 remove = 0", mgr.remove("x") == 0)
+    check("未知 IP state_of = ''", mgr.state_of("9.9.9.9") == "")
+    check("未知 IP 不在 active", "9.9.9.9" not in mgr.active_ips())
+    check("空 any_aborted = False", not mgr.any_aborted())
+
+
+@case
+def test_ndp_manager_multi_target():
+    """NdpManager 应支持并发多目标，逐目标独立跟踪、可单删可全停。"""
+    env = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                     my_lla=MY_LLA, prefixes=["2409:8a55::/64"])
+
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    # 不碰网卡：替掉嗅探与启停，NdpBlocker 仅作占位
+    orig_find, orig_start, orig_stop = ipv6.find_lla, ipv6.NdpBlocker.start, ipv6.NdpBlocker.stop
+    ipv6.find_lla = lambda *a, **k: (TGT_LLA, "嗅探")
+    ipv6.NdpBlocker.start = lambda self: (True, "ok")
+    ipv6.NdpBlocker.stop = lambda self, restore=True: 0
+    try:
+        mgr = ipv6.NdpManager()
+        devs = [
+            core.Device(ip="192.168.1.9", mac=TGT_MAC, note=""),
+            core.Device(ip="192.168.1.10", mac="02:00:00:00:00:03", note=""),
+            core.Device(ip="192.168.1.11", mac="02:00:00:00:00:04", note=""),
+        ]
+        oks = [mgr.add(FakeNI(), env, d, 1.5)[0] for d in devs]
+        check("三个目标均启动成功", all(oks), str(oks))
+        check("active_ips 含三个",
+              sorted(mgr.active_ips()) == ["192.168.1.10", "192.168.1.11", "192.168.1.9"],
+              str(mgr.active_ips()))
+        check("state_of 返回 ok", mgr.state_of("192.168.1.9") == "ok")
+
+        n = mgr.remove("192.168.1.9")
+        check("单删返回 1", n == 1, str(n))
+        check("单删后剩两个",
+              sorted(mgr.active_ips()) == ["192.168.1.10", "192.168.1.11"],
+              str(mgr.active_ips()))
+
+        n2 = mgr.restore_all()
+        check("全停返回剩余数", n2 == 2, str(n2))
+        check("全停后为空", mgr.active_ips() == [])
+        check("全停后 state_of=''", mgr.state_of("192.168.1.10") == "")
+    finally:
+        ipv6.find_lla, ipv6.NdpBlocker.start, ipv6.NdpBlocker.stop = (
+            orig_find, orig_start, orig_stop)
+
+
+@case
+def test_ndp_manager_rejects_protected():
+    """受保护设备（网关/本机）在 NdpManager 层就被拒，与 core.is_protected 同源。"""
+    env = ipv6.V6Env(supported=True, gw_lla=GW_LLA, gw_mac=GW_MAC,
+                     my_lla=MY_LLA, prefixes=["2409:8a55::/64"])
+
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    mgr = ipv6.NdpManager()
+    ok_gw, msg_gw = mgr.add(FakeNI(), env,
+                            core.Device(ip="10.0.0.1", mac=GW_MAC, note="网关"), 1.5)
+    check("网关被拒", not ok_gw and "受保护" in msg_gw, msg_gw)
+    ok_me, msg_me = mgr.add(FakeNI(), env,
+                            core.Device(ip="10.0.0.2", mac=MY_MAC, note="本机"), 1.5)
+    check("本机被拒", not ok_me and "受保护" in msg_me, msg_me)
+    check("被拒目标未入列", mgr.active_ips() == [])
+
+
+@case
+def test_ndp_manager_rejects_no_dual_stack():
+    """没有 IPv6 双栈（无前缀/无网关 LLA）时直接拒绝，不进入嗅探。"""
+    env = ipv6.V6Env(supported=True, gw_lla="", gw_mac="", my_lla=MY_LLA, prefixes=[])
+
+    class FakeNI:
+        iface = "fake0"
+        my_mac = MY_MAC
+
+    mgr = ipv6.NdpManager()
+    ok, msg = mgr.add(FakeNI(), env,
+                     core.Device(ip="1.2.3.4", mac=TGT_MAC, note=""), 1.5)
+    check("非双栈被拒", not ok, msg)
+
+
 if __name__ == "__main__":
     for fn in (
         test_na_structure,
@@ -200,6 +291,10 @@ if __name__ == "__main__":
         test_parse_neighbors,
         test_dual_stack_judgement,
         test_valid_mac,
+        test_ndp_manager_empty_safe,
+        test_ndp_manager_multi_target,
+        test_ndp_manager_rejects_protected,
+        test_ndp_manager_rejects_no_dual_stack,
     ):
         fn()
 
