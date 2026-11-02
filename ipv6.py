@@ -355,6 +355,13 @@ class NdpBlocker:
         self.aborted = False
         self.abort_reason = ""
         self._lock = threading.Lock()
+        # 会话代际 + 发送锁（第 11 轮）：与 core.Killer 同源的顺序保证——
+        # stop(restore) 推进代际，让「还没检查代际的在途发送」作废；
+        # 发送在 _send_lock 内排他，于是推进代际必然发生在当前 sendp 返回之后。
+        # 缺了它，最后一批投毒帧可能落在恢复帧之后，目标残留 IPv6 被阻断。
+        self._gen = 0
+        self._send_lock = threading.RLock()
+        self._late_sends = 0
 
     # ---------------------------------------------------------- 对外接口
 
@@ -377,10 +384,19 @@ class NdpBlocker:
             return False, "目标 MAC 即网关自身（受保护设备），拒绝"
         return True, "ok"
 
+    def _bump_gen(self) -> int:
+        """推进会话代际：等当前 sendp 返回后，让在途批次的剩余发送作废。"""
+        with self._send_lock:
+            self._gen += 1
+            return self._gen
+
     def start(self) -> tuple[bool, str]:
+        if self._thread is not None and self._thread.is_alive():
+            return False, "该目标已有 IPv6 阻断线程在运行"
         ok, why = self.preflight()
         if not ok:
             return False, why
+        self._stop.clear()
         self._sniffer = self._start_ns_sniffer()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -392,6 +408,7 @@ class NdpBlocker:
 
     def stop(self, restore: bool = True) -> int:
         self._stop.set()
+        self._bump_gen()          # 先作废在途发送，再等线程退出
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
@@ -412,7 +429,7 @@ class NdpBlocker:
 
     # ---------------------------------------------------------- 内部实现
 
-    def _send(self, pkt):
+    def _send(self, pkt, gen: int | None = None):
         """唯一发包出口。这里拒绝一切组播/广播目的地址。
 
         这是最后一道结构性保险：即使上层传错参数，
@@ -424,7 +441,11 @@ class NdpBlocker:
             raise core.BlockError(
                 f"拒绝向组播/广播地址 {dst} 发送 NA —— 这会切断整网 IPv6")
         s = core.scapy_mod()
-        s.sendp(pkt, iface=self.ni.iface, verbose=0)
+        with self._send_lock:
+            if gen is not None and gen != self._gen:
+                self._late_sends += 1
+                return
+            s.sendp(pkt, iface=self.ni.iface, verbose=0)
         with self._lock:
             self._sent += 1
 
@@ -451,11 +472,11 @@ class NdpBlocker:
             tgt=self.target_lla, lladdr=self.ni.my_mac)
         return to_target, to_gw
 
-    def _emit(self, restore: bool):
+    def _emit(self, restore: bool, gen: int | None = None):
         to_target, to_gw = self._frames(restore)
-        self._send(to_target)
+        self._send(to_target, gen)
         if self.poison_gateway:
-            self._send(to_gw)
+            self._send(to_gw, gen)
 
     def _restore(self) -> int:
         """回填真实映射。多发几次，抵消丢包。"""
@@ -528,8 +549,9 @@ class NdpBlocker:
 
     def _loop(self):
         while not self._stop.is_set():
+            gen = self._gen          # 每轮取当前代际：stop/移除后本轮剩余发送自动作废
             try:
-                self._emit(restore=False)
+                self._emit(restore=False, gen=gen)
             except core.BlockError as e:
                 self.aborted = True
                 self.abort_reason = str(e)

@@ -31,9 +31,9 @@ WiFiKill 是一个 Windows 桌面 GUI 应用：扫描局域网设备，并对选
 | `selftest.py` | GUI 端到端自检（51 项，含守护演练、哨兵链路、IPv6 可见性、换网中止） |
 | `tests/test_edge.py` | 边界与故障路径测试（75 项） |
 | `tests/test_gui_smoke.py` | GUI 冒烟测试（26 项，CI 可跑、绝不发包） |
-| `tests/test_ipv6.py` | IPv6 报文级测试（58 项，CI 可跑） |
+| `tests/test_ipv6.py` | IPv6 报文级测试（65 项，CI 可跑） |
 | `tests/test_guard.py` | 本机守护单元测试（21 项，CI 可跑） |
-| `tests/test_sentinel.py` | 全网哨兵单元测试（11 项，CI 可跑） |
+| `tests/test_sentinel.py` | 全网哨兵单元测试（12 项，CI 可跑） |
 | `tests/test_throttle.py` | 占空比限速单元测试（6 项，CI 可跑） |
 | `build.py` | 一键构建 + 语义化版本自增 + 文档版本同步 |
 | `versions.json` | 版本真源（app / user_manual / tech_manual / build / released） |
@@ -54,9 +54,9 @@ python gui.py                    # 或 .buildenv\Scripts\python gui.py
 
 # 测试（纯脚本，非 pytest，失败退出码非 0）
 python tests/test_edge.py        # 边界 75 项，不碰真实设备
-python tests/test_ipv6.py        # IPv6 报文级 58 项，不发包
+python tests/test_ipv6.py        # IPv6 报文级 65 项，不发包
 python tests/test_guard.py       # 本机守护 21 项，不发包
-python tests/test_sentinel.py    # 全网哨兵 11 项，不发包
+python tests/test_sentinel.py    # 全网哨兵 12 项，不发包
 python tests/test_throttle.py    # 占空比限速 6 项，不发包
 python tests/test_gui_smoke.py   # GUI 冒烟 26 项，不发包（CI 也跑）
 python selftest.py               # GUI 端到端 51 项，驱动真实窗口（守护以演练模式）

@@ -224,6 +224,33 @@ def test_guard_hunt_dry_run_silent(monkeypatch):
     assert events == []
 
 
+def test_baseline_cap_evicts_unclaimed_first(monkeypatch):
+    """第 11 轮：私有 Wi-Fi 地址轮换不能把基线撑爆，且被认领的设备优先保留。
+
+    探针复现：20 轮 × 50 台新 MAC 之后 known 从 20 涨到 1020，且没有上限常量，
+    sentinel.json 与待认领列表只会一直涨。
+    """
+    _tmp_sentinel(monkeypatch)
+    monkeypatch.setattr(core, "SENTINEL_MAX_KNOWN", 60)
+    sen = core.Sentinel()
+    base = [_Dev(f"10.0.0.{i + 2}", f"02:00:00:00:00:{i:02x}") for i in range(10)]
+    sen.feed_scan(base)
+    claimed = [d.mac for d in base[:3]]
+    for m in claimed:
+        sen.claim(m)
+
+    rounds = 0
+    while len(sen._known) <= 60 and rounds < 10:
+        rounds += 1
+        sen.feed_scan([_Dev(f"10.9.{rounds}.{i}",
+                            f"06:aa:{rounds // 256:02x}:{rounds % 256:02x}:"
+                            f"{i // 256:02x}:{i % 256:02x}") for i in range(40)])
+
+    assert len(sen._known) <= 60, f"基线应有上限，实际 {len(sen._known)}"
+    assert all(m in sen._known for m in claimed), "已认领的设备应优先保留"
+    assert any(e["kind"] == "forget" for e in sen.events), "淘汰应留下事件记录"
+
+
 def test_sentinel_corrupt_baseline_selfheals(monkeypatch):
     """基线被写坏时自愈，而不是每次扫描都炸。
 

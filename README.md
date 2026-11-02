@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="https://img.shields.io/badge/version-v2.7.2-8C9E93" alt="version">
+<img src="https://img.shields.io/badge/version-v2.7.3-8C9E93" alt="version">
 <img src="https://img.shields.io/badge/python-3.10%2B-8C9E93" alt="python">
 <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-8C9E93" alt="platform">
 <img src="https://img.shields.io/badge/license-学习研究用-C4A785" alt="license">
@@ -189,7 +189,7 @@ ARP 层做不了真限速。本程序的诚实做法是**占空比节流**：10 
 | `tray.py` | 托盘：纯 ctypes 调 `Shell_NotifyIcon`，独立线程消息循环 |
 | `ipv6.py` | IPv6 层：环境探测、LLA 探明、多目标 NDP 投毒与失控保护 |
 | `build.py` | 一键构建：版本自增 → 文档版本同步与**校验** → 三产物 |
-| `tests/` | 六套无头测试（197 项）+ GUI 冒烟（CI 可跑） |
+| `tests/` | 六套无头测试（205 项）+ GUI 冒烟（CI 可跑） |
 | `selftest.py` | 真机 GUI 端到端自检（51 项） |
 
 ## 安全设计
@@ -380,7 +380,7 @@ WiFi-Kill/
 ├── build.py              构建 + 版本自增 + 文档版本同步与校验
 ├── versions.json         版本真源
 ├── selftest.py           真机 GUI 自检（51 项）
-├── tests/                六套无头测试（197 项，含 GUI 冒烟 26 项）
+├── tests/                六套无头测试（205 项，含 GUI 冒烟 26 项）
 ├── tools/                图标与概念图生成
 ├── installer/            Inno Setup 脚本 + 中文语言 + 免责声明
 ├── docs/                 用户手册 / 技术手册 / images 概念图
@@ -393,9 +393,9 @@ WiFi-Kill/
 
 ```bash
 python tests/test_edge.py        # 边界与故障路径 75 项
-python tests/test_ipv6.py        # IPv6 报文级 58 项
+python tests/test_ipv6.py        # IPv6 报文级 65 项
 python tests/test_guard.py       # 本机守护 21 项
-python tests/test_sentinel.py    # 全网哨兵 11 项
+python tests/test_sentinel.py    # 全网哨兵 12 项
 python tests/test_throttle.py    # 占空比限速 6 项
 python tests/test_gui_smoke.py   # GUI 冒烟 26 项（不发包，CI 也跑）
 python selftest.py               # 真机端到端 51 项（驱动真实窗口）
@@ -413,7 +413,7 @@ python build.py --bump patch     # 版本自增 + 文档同步与校验 + 三产
 
 | 层 | 规模 | 说明 |
 |---|---|---|
-| 无头测试 | **197 项** | 边界 75 + IPv6 58 + 守护 21 + 哨兵 11 + 限速 6 + GUI 冒烟 26 |
+| 无头测试 | **205 项** | 边界 75 + IPv6 65 + 守护 21 + 哨兵 12 + 限速 6 + GUI 冒烟 26 |
 | 真机自检 | **51 项** | 真实窗口 + 扫描 + 幽灵设备端到端（限速/守护/哨兵/换网中止） |
 | 清单兜底 | 17 项 | 编译、红线、安全不变量、dry-run 纯净、版本一致、文档计数与实跑一致 |
 
@@ -421,9 +421,9 @@ python build.py --bump patch     # 版本自增 + 文档同步与校验 + 三产
 
 | 项目 | 当前版本 | 说明 |
 |---|---|---|
-| 程序 | **v2.7.2** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
-| [用户手册](docs/USER_MANUAL.md) | v1.7.2 | 面向使用者，含教程 A–P 与故障排查 |
-| [技术手册](docs/TECH_MANUAL.md) | v1.7.2 | 面向开发者，含报文/线程/状态机/测试/发布 |
+| 程序 | **v2.7.3** | 见 [Releases](https://github.com/Asaceoo/WiFi-Kill/releases) |
+| [用户手册](docs/USER_MANUAL.md) | v1.7.3 | 面向使用者，含教程 A–P 与故障排查 |
+| [技术手册](docs/TECH_MANUAL.md) | v1.7.3 | 面向开发者，含报文/线程/状态机/测试/发布 |
 | [更新日志](CHANGELOG.md) | — | 每个版本改了什么 |
 
 版本号由 `build.py` 语义化递增，程序与两份手册在构建时自动同步并**校验**（不一致即中止构建），

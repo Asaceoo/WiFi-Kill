@@ -31,7 +31,7 @@ except ImportError:
 WINDOWS = os.name == "nt"
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 APP_NAME = "WiFiKill"
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.7.3"
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -1530,6 +1530,9 @@ class Guard:
 
 SENTINEL_FILE = APP_DIR / "sentinel.json"
 SENTINEL_MAX_EVENTS = 200
+# 基线上限（第 11 轮探针）：开启「私有 Wi-Fi 地址」的设备每次接入都可能换 MAC，
+# 没有上限时 sentinel.json 与待认领列表会无限增长。
+SENTINEL_MAX_KNOWN = 2000
 NOTIFY_DEDUP_SECONDS = 300.0   # 同一事件 5 分钟内只弹一次通知
 
 
@@ -1608,11 +1611,34 @@ class Sentinel:
                 else:
                     if getattr(d, "ip", ""):
                         rec["ip"] = d.ip
+        evicted = self._trim()
+        if evicted:
+            LOG.emit("warn", f"哨兵基线已达上限（{SENTINEL_MAX_KNOWN}），"
+                     f"已自动移出 {evicted} 台最早出现且未认领的设备")
         for n in new:
             self._notify_dedup(f"new:{n['mac']}", "发现新设备",
                                f"{n['ip']} 首次接入网络，已记入哨兵待认领")
         self.save()
         return new
+
+    def _trim(self) -> int:
+        """基线超过上限时淘汰：**未认领优先**，同组内按首次出现时间从早到晚。
+
+        为什么不直接砍最早的：已被用户「认领」的是现任住户，应当优先保留；
+        未认领的往往是随机 MAC 的过客，先淘汰它们对用户最友好。
+        """
+        over = len(self._known) - SENTINEL_MAX_KNOWN
+        if over <= 0:
+            return 0
+        victims = sorted(self._known.items(),
+                         key=lambda kv: (bool(kv[1].get("known")),
+                                         float(kv[1].get("first") or 0.0)))
+        with self._lock:
+            for mac, rec in victims[:over]:
+                self._known.pop(mac, None)
+                self._add_event("forget", mac, rec.get("ip", ""),
+                                "基线超限：已自动移出最早未认领的设备")
+        return over
 
     # --- 认领 / 移出 ---
 

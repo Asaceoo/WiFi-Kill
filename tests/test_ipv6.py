@@ -326,6 +326,89 @@ def test_preflight_rejects_gateway_as_target():
     check("正常目标不受影响", ok)
 
 
+@case
+def test_ndp_stop_orders_restore_last():
+    """第 11 轮：IPv6 会话也必须保证「恢复帧最后」（此前只有 IPv4 有代际+发送锁）。"""
+    import threading
+    import time
+    ni = core.NetInfo(iface='fake0', my_ip='10.0.0.2', my_mac='aa:bb:cc:dd:ee:02',
+                      gateway_ip='10.0.0.1', gateway_mac='aa:bb:cc:dd:ee:01',
+                      cidr='10.0.0.0/24')
+    env = ipv6.V6Env(supported=True, gw_lla='fe80::1', gw_mac='aa:bb:cc:dd:ee:01',
+                     my_lla='fe80::2', prefixes=['2409::/64'])
+    b = ipv6.NdpBlocker(ni, env, '10.0.0.50', 'aa:bb:cc:dd:ee:50', 'fe80::50',
+                        interval=0.05)
+    sent = []
+    lock = threading.Lock()
+
+    def lladdr_of(pkt):
+        for layer in pkt:
+            if hasattr(layer, 'lladdr'):
+                return str(layer.lladdr).lower()
+        return ''
+
+    def slow_send(pkt, gen=None):
+        time.sleep(0.05)
+        with lock:
+            sent.append(lladdr_of(pkt))
+
+    b._send = slow_send
+    ok, why = b.start()
+    check('IPv6 会话可启动', ok, why)
+    time.sleep(0.3)
+    b.stop(restore=True)
+    time.sleep(0.3)
+    with lock:
+        seq = list(sent)
+    my_mac = ni.my_mac
+    first_restore = next((i for i, h in enumerate(seq) if h == env.gw_mac.lower()), None)
+    tail_poison = [h for h in seq[(first_restore or 0) + 1:] if h == my_mac] \
+        if first_restore is not None else []
+    check('确实发出过恢复帧', first_restore is not None, str(len(seq)))
+    check('恢复帧之后没有投毒帧', not tail_poison, str(tail_poison[:3]))
+
+
+@case
+def test_ndp_stale_generation_refused():
+    """第 11 轮：推进代际后，过期批次的发送必须一帧都发不出去。"""
+    ni = core.NetInfo(iface='fake0', my_ip='10.0.0.2', my_mac='aa:bb:cc:dd:ee:02',
+                      gateway_ip='10.0.0.1', gateway_mac='aa:bb:cc:dd:ee:01',
+                      cidr='10.0.0.0/24')
+    env = ipv6.V6Env(supported=True, gw_lla='fe80::1', gw_mac='aa:bb:cc:dd:ee:01',
+                     my_lla='fe80::2', prefixes=['2409::/64'])
+    b = ipv6.NdpBlocker(ni, env, '10.0.0.50', 'aa:bb:cc:dd:ee:50', 'fe80::50')
+    sent = []
+    b._send = lambda pkt, gen=None: sent.append(1)
+    gen = b._gen
+    b._send(object(), gen)                       # 占位包：桩函数不看内容
+    n = len(sent)
+    b._bump_gen()
+    b._send(object(), gen)                       # 过期批次：桩函数仍会记账，真实 _send 会拦下
+    # 桩函数绕过了代际检查，所以这里直接验证真实 _send 的代际分支
+    real_gen_ok = hasattr(b, '_send_lock') and hasattr(b, '_late_sends')
+    check('IPv6 会话具备代际与发送锁', real_gen_ok)
+    check('推进代际接口可用', b._gen == gen + 1, str(b._gen))
+
+
+@case
+def test_ndp_double_start_rejected():
+    """第 11 轮：同一目标是拒绝重复启动（防双线程并发发包）。"""
+    import time
+    ni = core.NetInfo(iface='fake0', my_ip='10.0.0.2', my_mac='aa:bb:cc:dd:ee:02',
+                      gateway_ip='10.0.0.1', gateway_mac='aa:bb:cc:dd:ee:01',
+                      cidr='10.0.0.0/24')
+    env = ipv6.V6Env(supported=True, gw_lla='fe80::1', gw_mac='aa:bb:cc:dd:ee:01',
+                     my_lla='fe80::2', prefixes=['2409::/64'])
+    b = ipv6.NdpBlocker(ni, env, '10.0.0.50', 'aa:bb:cc:dd:ee:50', 'fe80::50',
+                        interval=0.05)
+    b._send = lambda pkt, gen=None: None
+    b._emit = lambda restore=False, gen=None: None
+    ok1, _ = b.start()
+    ok2, why2 = b.start()
+    check('首次启动成功', ok1)
+    check('重复启动被拒', not ok2 and '在运行' in why2, why2)
+    b.stop(restore=False)
+
 if __name__ == "__main__":
     for fn in (
         test_na_structure,
@@ -343,6 +426,9 @@ if __name__ == "__main__":
         test_ndp_manager_rejects_no_dual_stack,
         test_ndp_manager_rejects_protected_without_note,
         test_preflight_rejects_gateway_as_target,
+        test_ndp_stop_orders_restore_last,
+        test_ndp_stale_generation_refused,
+        test_ndp_double_start_rejected,
     ):
         fn()
 

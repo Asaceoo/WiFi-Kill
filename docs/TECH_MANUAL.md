@@ -1,6 +1,6 @@
 # WiFiKill 技术手册
 
-> 文档版本：**v1.7.2** · 对应程序：**v2.7.2** · 更新日期：2026-11-02
+> 文档版本：**v1.7.3** · 对应程序：**v2.7.3** · 更新日期：2026-11-02
 
 面向**开发者**：模块边界、报文、线程、状态机、安全护栏、测试体系与发布流水线。
 使用者请看 [USER_MANUAL.md](USER_MANUAL.md)。
@@ -56,7 +56,9 @@
 
 - `probe_env()`：只读 `conf.route6` → `supported / gw_lla / my_lla / prefixes`；
 - `find_lla()`：被动嗅探（只读）→ mDNS 询问（QU 位必须为 1）兜底；
-- `NdpBlocker`：单目标投毒 + NS 代答 + `_watchdog` 自检；`NdpManager`：多目标并发 + 逐目标护栏。
+- `NdpBlocker`：单目标投毒 + NS 代答 + `_watchdog` 自检；`NdpManager`：多目标并发 + 逐目标护栏；
+  第 11 轮起与 `core.Killer` 同源具备**会话代际 + 发送锁**（`_gen` / `_send_lock`），
+  并对同一目标拒绝重复 `start()`（防双线程并发发包）。
 
 ### 2.4 本机守护 `Guard`
 
@@ -66,6 +68,9 @@
 ### 2.5 全网哨兵 `Sentinel`
 
 基线 `dict[mac -> {ip,name,known,first}]` + 事件流（≤200），落盘 `sentinel.json`；首轮静默入册，
+**基线上限 `SENTINEL_MAX_KNOWN = 2000`**（第 11 轮）：超限按「未认领优先、出现最早优先」淘汰并留事件，
+防止开启「私有 Wi-Fi 地址」的设备轮换 MAC 时把 `sentinel.json` 与待认领列表撑爆（探针：20 轮 × 50 台新 MAC
+曾让基线从 20 涨到 1020）；
 之后新 MAC 触发 `new` 事件与去重通知（同 key 5 分钟一次）。
 
 ### 2.6 阻断验证 `verify_targets`
@@ -224,6 +229,8 @@ IDLE ──add()──► ARMED ──start()──► ACTIVE ⇄ (duty<100) THR
 | 守护 fail closed | `Guard._establish_baseline()` | 双源分歧/不可达 → 不启动、不采纳 |
 | 单实例 | `core.SingleInstance` | 绑定 `127.0.0.1:51999`；管理员重启时先释放锁再拉起新实例 |
 | 换网中止 | `matches_network()` + `abandon()` | 防「界面阻断中、目标照常上网」 |
+| IPv6 顺序保证 | `NdpBlocker._gen` + `_send_lock` | 与 IPv4 同源：恢复帧一定最后（第 11 轮补齐） |
+| 基线上限 | `Sentinel._trim()` | 超限淘汰最早未认领设备，防无限增长 |
 
 ## 9. 环境探测
 
@@ -246,14 +253,14 @@ IDLE ──add()──► ARMED ──start()──► ACTIVE ⇄ (duty<100) THR
 
 ## 11. 测试体系
 
-### 11.1 六套无头测试（197 项，CI 可跑）
+### 11.1 六套无头测试（205 项，CI 可跑）
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
 | `tests/test_edge.py` | 75 | 异常输入 / 并发 / 崩溃现场 / 安全不变量 API 层 / 第 5–10 轮回归 |
-| `tests/test_ipv6.py` | 58 | 报文级：NA 结构、组播保险、preflight、mDNS、邻居表解析 |
+| `tests/test_ipv6.py` | 65 | 报文级：NA 结构、组播保险、preflight、mDNS、邻居表解析 |
 | `tests/test_guard.py` | 21 | 守护：基准建立/重估/去抖/自愈/演练纯净 |
-| `tests/test_sentinel.py` | 11 | 哨兵：基线、告警、去重、认领/移出、事件上限、损坏自愈 |
+| `tests/test_sentinel.py` | 12 | 哨兵：基线、告警、去重、认领/移出、事件上限、损坏自愈 |
 | `tests/test_throttle.py` | 6 | 占空比：档位、钳制、持久化、真循环交替 |
 | `tests/test_gui_smoke.py` | 26 | 真实建窗 + 扫描渲染 + 新功能入口 + `ui` 常量静态校验（不发包，进 CI） |
 
